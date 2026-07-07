@@ -32,7 +32,7 @@ info "Memeriksa Python 3..."
 if ! command -v python3 >/dev/null 2>&1; then
     warn "Python 3 tidak ditemukan. Mencoba install..."
     if command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update -qq && sudo apt-get install -y python3 python3-pip python3-venv
+        sudo apt-get update -qq && sudo apt-get install -y python3 python3-pip
     elif command -v dnf >/dev/null 2>&1; then
         sudo dnf install -y python3 python3-pip
     elif command -v yum >/dev/null 2>&1; then
@@ -45,25 +45,11 @@ PYTHON_VERSION=$(python3 --version 2>&1)
 success "Ditemukan: $PYTHON_VERSION"
 
 # ============================================================
-# 2. Virtual environment
-# ============================================================
-info "Menyiapkan virtual environment..."
-if [ ! -d "venv" ]; then
-    python3 -m venv venv
-    success "Virtual environment dibuat di ./venv"
-else
-    success "Virtual environment sudah ada."
-fi
-
-# shellcheck disable=SC1091
-source venv/bin/activate
-
-# ============================================================
-# 3. Install dependensi
+# 2. Install dependensi
 # ============================================================
 info "Menginstall dependensi Python..."
-pip install --quiet --upgrade pip
-pip install --quiet -r requirements.txt
+pip3 install --quiet --upgrade pip
+pip3 install --quiet -r requirements.txt
 success "Dependensi terinstall."
 
 # ============================================================
@@ -305,12 +291,10 @@ success "Setup selesai!"
 echo ""
 echo "  Untuk menjalankan bot:"
 echo ""
-echo "    source venv/bin/activate"
 echo "    python3 main.py"
 echo ""
 echo "  Untuk jalan di background (VPS):"
 echo ""
-echo "    source venv/bin/activate"
 echo "    nohup python3 main.py > plinko.log 2>&1 &"
 echo "    echo \"PID: \$!\""
 echo ""
