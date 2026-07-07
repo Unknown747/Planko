@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # main.py - Auto Bet Plinko Stake.com
 import requests
-import json
 import time
 import os
 import sys
@@ -75,16 +74,17 @@ def _parse_env():
         errors.append(f"STRATEGY='{strategy}' tidak valid. Pilihan: FLAT, ANTI_MARTINGALE.")
 
     bet_multiplier = get_float('BET_MULTIPLIER', 2.0)
-    if bet_multiplier <= 1.0:
-        errors.append(f"BET_MULTIPLIER={bet_multiplier} harus lebih dari 1 (contoh: 2).")
-
     win_streak_cap = get_int('WIN_STREAK_CAP', 3)
-    if win_streak_cap < 1:
-        errors.append(f"WIN_STREAK_CAP={win_streak_cap} harus minimal 1.")
-
     max_bet = get_float('MAX_BET', 0)  # 0 = tidak ada batas
-    if max_bet < 0:
-        errors.append(f"MAX_BET={max_bet} tidak boleh negatif.")
+
+    # Validasi parameter Anti-Martingale hanya jika strategi benar-benar memakainya
+    if strategy == 'ANTI_MARTINGALE':
+        if bet_multiplier <= 1.0:
+            errors.append(f"BET_MULTIPLIER={bet_multiplier} harus lebih dari 1 (contoh: 2).")
+        if win_streak_cap < 1:
+            errors.append(f"WIN_STREAK_CAP={win_streak_cap} harus minimal 1.")
+        if max_bet < 0:
+            errors.append(f"MAX_BET={max_bet} tidak boleh negatif.")
 
     max_errors = get_int('MAX_CONSECUTIVE_ERRORS', 5)
     if max_errors < 1:
@@ -128,7 +128,8 @@ except ValueError as _cfg_err:
 class State:
     def __init__(self):
         self.balance = 0.0
-        self.initial_balance = 0.0   # diset setelah get_balance() pertama
+        self.initial_balance = 0.0
+        self.balance_initialized = False  # True setelah saldo awal berhasil diambil
         self.total_wagered = 0.0
         self.total_bets = 0
         self.is_running = True
@@ -321,7 +322,10 @@ def place_plinko_bet():
             if rate_limit_retries > CONFIG['MAX_RATE_LIMIT_RETRIES']:
                 raise Exception(f'Rate limit: sudah retry {rate_limit_retries} kali, berhenti.')
 
-            retry_after = int(response.headers.get('retry-after', 5))
+            try:
+                retry_after = int(response.headers.get('retry-after', 5))
+            except (ValueError, TypeError):
+                retry_after = 5
             wait_time = max(retry_after, 5)
             print(f"\n⚠️ Rate limit (429). Menunggu {wait_time}s... (retry #{rate_limit_retries}/{CONFIG['MAX_RATE_LIMIT_RETRIES']})")
             time.sleep(wait_time)
@@ -451,7 +455,8 @@ def check_stop_conditions():
     Return True jika harus berhenti.
     """
     # Take profit — cek lebih dahulu (kondisi positif)
-    if CONFIG['TAKE_PROFIT'] > 0 and state.net_profit >= CONFIG['TAKE_PROFIT']:
+    # Guard balance_initialized mencegah false positive sebelum saldo awal terisi
+    if CONFIG['TAKE_PROFIT'] > 0 and state.balance_initialized and state.net_profit >= CONFIG['TAKE_PROFIT']:
         clear_line()
         net_str = format_rupiah(state.net_profit)
         target_str = format_rupiah(CONFIG['TAKE_PROFIT'])
@@ -472,8 +477,8 @@ def check_stop_conditions():
         print(f"   Total wagered: {format_rupiah(state.total_wagered)}")
         return True
 
-    # Stop loss
-    if CONFIG['STOP_LOSS'] > 0 and state.balance > 0 and state.balance <= CONFIG['STOP_LOSS']:
+    # Stop loss — balance >= 0 agar saldo 0 persis juga ikut tertangkap
+    if CONFIG['STOP_LOSS'] > 0 and state.balance >= 0 and state.balance <= CONFIG['STOP_LOSS']:
         clear_line()
         print(f"\n🛑 STOP LOSS tercapai!")
         print(f"   Saldo    : {format_rupiah(state.balance)}")
@@ -527,6 +532,7 @@ def main():
         sys.exit(1)
 
     state.initial_balance = initial_balance
+    state.balance_initialized = True
     print(f"✅ Saldo awal: {format_rupiah(initial_balance)} {CONFIG['CURRENCY']}")
     if CONFIG['TAKE_PROFIT'] > 0:
         target_balance = initial_balance + CONFIG['TAKE_PROFIT']
