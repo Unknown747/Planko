@@ -71,7 +71,7 @@ success "Dependensi terinstall."
 # ============================================================
 ENV_FILE=".env"
 OLD_TOKEN="" OLD_RISK="" OLD_ROWS="" OLD_BET="" OLD_CURRENCY=""
-OLD_DELAY="" OLD_STOP_LOSS="" OLD_WAGER_TARGET="" OLD_MAX_ERRORS="" OLD_MAX_RETRIES=""
+OLD_DELAY="" OLD_STOP_LOSS="" OLD_TAKE_PROFIT="" OLD_TP_DELAY="" OLD_WAGER_TARGET="" OLD_MAX_ERRORS="" OLD_MAX_RETRIES=""
 
 if [ -f "$ENV_FILE" ]; then
     OLD_TOKEN=$(grep -E '^STAKE_API_TOKEN=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
@@ -81,6 +81,8 @@ if [ -f "$ENV_FILE" ]; then
     OLD_CURRENCY=$(grep -E '^CURRENCY=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
     OLD_DELAY=$(grep -E '^BASE_DELAY_MS=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
     OLD_STOP_LOSS=$(grep -E '^STOP_LOSS=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
+    OLD_TAKE_PROFIT=$(grep -E '^TAKE_PROFIT=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
+    OLD_TP_DELAY=$(grep -E '^TAKE_PROFIT_DELAY_SEC=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
     OLD_WAGER_TARGET=$(grep -E '^WAGER_TARGET=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
     OLD_MAX_ERRORS=$(grep -E '^MAX_CONSECUTIVE_ERRORS=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
     OLD_MAX_RETRIES=$(grep -E '^MAX_RATE_LIMIT_RETRIES=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
@@ -177,6 +179,18 @@ while true; do
 done
 
 while true; do
+    TAKE_PROFIT=$(prompt_val "TAKE_PROFIT berhenti jika profit bersih >= nilai ini (0 = nonaktif)" "${OLD_TAKE_PROFIT:-10000}")
+    if is_number "$TAKE_PROFIT"; then break; fi
+    warn "TAKE_PROFIT harus angka >= 0."
+done
+
+while true; do
+    TAKE_PROFIT_DELAY_SEC=$(prompt_val "TAKE_PROFIT_DELAY_SEC countdown sebelum stop saat take profit (detik)" "${OLD_TP_DELAY:-30}")
+    if is_integer "$TAKE_PROFIT_DELAY_SEC" && [ "$TAKE_PROFIT_DELAY_SEC" -ge 0 ]; then break; fi
+    warn "TAKE_PROFIT_DELAY_SEC harus bilangan bulat >= 0."
+done
+
+while true; do
     WAGER_TARGET=$(prompt_val "WAGER_TARGET batas total wager (0 = unlimited)" "${OLD_WAGER_TARGET:-0}")
     if is_number "$WAGER_TARGET"; then break; fi
     warn "WAGER_TARGET harus angka >= 0."
@@ -210,6 +224,8 @@ done
     echo ""
     echo "BASE_DELAY_MS=${BASE_DELAY_MS}"
     echo "STOP_LOSS=${STOP_LOSS}"
+    echo "TAKE_PROFIT=${TAKE_PROFIT}"
+    echo "TAKE_PROFIT_DELAY_SEC=${TAKE_PROFIT_DELAY_SEC}"
     echo "WAGER_TARGET=${WAGER_TARGET}"
     echo "MAX_CONSECUTIVE_ERRORS=${MAX_CONSECUTIVE_ERRORS}"
     echo "MAX_RATE_LIMIT_RETRIES=${MAX_RATE_LIMIT_RETRIES}"

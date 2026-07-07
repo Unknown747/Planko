@@ -60,6 +60,14 @@ def _parse_env():
     if wager_target < 0:
         errors.append(f"WAGER_TARGET={wager_target} tidak boleh negatif.")
 
+    take_profit = get_float('TAKE_PROFIT', 0)
+    if take_profit < 0:
+        errors.append(f"TAKE_PROFIT={take_profit} tidak boleh negatif.")
+
+    take_profit_delay = get_int('TAKE_PROFIT_DELAY_SEC', 30)
+    if take_profit_delay < 0:
+        errors.append(f"TAKE_PROFIT_DELAY_SEC={take_profit_delay} tidak boleh negatif.")
+
     max_errors = get_int('MAX_CONSECUTIVE_ERRORS', 5)
     if max_errors < 1:
         errors.append(f"MAX_CONSECUTIVE_ERRORS={max_errors} harus minimal 1.")
@@ -81,6 +89,8 @@ def _parse_env():
         'BASE_DELAY_MS': base_delay,
         'STOP_LOSS': stop_loss,
         'WAGER_TARGET': wager_target,
+        'TAKE_PROFIT': take_profit,
+        'TAKE_PROFIT_DELAY_SEC': take_profit_delay,
         'MAX_CONSECUTIVE_ERRORS': max_errors,
         'MAX_RATE_LIMIT_RETRIES': max_retries,
         'GRAPHQL_URL': os.getenv('GRAPHQL_URL', 'https://stake.com/_api/graphql'),
@@ -96,12 +106,18 @@ except ValueError as _cfg_err:
 class State:
     def __init__(self):
         self.balance = 0.0
+        self.initial_balance = 0.0   # diset setelah get_balance() pertama
         self.total_wagered = 0.0
         self.total_bets = 0
         self.is_running = True
         self.consecutive_errors = 0
         self.start_time = datetime.now()
         self.bet_results = []
+
+    @property
+    def net_profit(self):
+        """Profit bersih sejak bot mulai (balance sekarang - balance awal)."""
+        return self.balance - self.initial_balance
 
 state = State()
 
@@ -308,25 +324,60 @@ def clear_line():
     sys.stdout.write('\033[2K\r')
     sys.stdout.flush()
 
+def take_profit_countdown(seconds):
+    """
+    Countdown sebelum stop saat Take Profit tercapai.
+    User bisa tekan Ctrl+C untuk membatalkan dan lanjut bet.
+    """
+    print(f"\n💰 TAKE PROFIT tercapai! Bot berhenti dalam {seconds} detik...")
+    print("   (Tekan Ctrl+C dalam countdown ini untuk LANJUT bet)\n")
+    try:
+        for remaining in range(seconds, 0, -1):
+            print(f"\r   ⏳ Berhenti dalam {remaining:2d} detik...", end='', flush=True)
+            time.sleep(1)
+        print()  # newline setelah countdown
+        return True  # konfirmasi berhenti
+    except KeyboardInterrupt:
+        clear_line()
+        print("\n▶️  Countdown dibatalkan, melanjutkan bet...\n")
+        return False  # lanjut bet
+
 def print_header():
     """Print header info"""
     print("\n" + "="*55)
     print("🎰  P L I N K O   A U T O - B E T")
     print("="*55)
-    print(f"⚙️  Risk     : {CONFIG['RISK']}")
-    print(f"📊 Rows     : {CONFIG['ROWS']}")
-    print(f"💰 Bet      : {format_rupiah(CONFIG['BET_AMOUNT'])}")
-    print(f"🛑 Stop Loss: {format_rupiah(CONFIG['STOP_LOSS'])}")
+    print(f"⚙️  Risk      : {CONFIG['RISK']}")
+    print(f"📊 Rows      : {CONFIG['ROWS']}")
+    print(f"💰 Bet       : {format_rupiah(CONFIG['BET_AMOUNT'])}")
+    print(f"🛑 Stop Loss : {format_rupiah(CONFIG['STOP_LOSS'])}")
+    if CONFIG['TAKE_PROFIT'] > 0:
+        print(f"✅ Take Profit: {format_rupiah(CONFIG['TAKE_PROFIT'])} profit (delay {CONFIG['TAKE_PROFIT_DELAY_SEC']}s)")
     if CONFIG['WAGER_TARGET'] > 0:
         print(f"🎯 Wager Target: {format_rupiah(CONFIG['WAGER_TARGET'])}")
-    print(f"⏱️  Delay    : {CONFIG['BASE_DELAY_MS']}ms")
+    print(f"⏱️  Delay     : {CONFIG['BASE_DELAY_MS']}ms")
     print("="*55)
 
 def check_stop_conditions():
     """
-    Cek kondisi stop loss dan wager target.
+    Cek semua kondisi stop: take profit, stop loss, wager target.
     Return True jika harus berhenti.
     """
+    # Take profit — cek lebih dahulu (kondisi positif)
+    if CONFIG['TAKE_PROFIT'] > 0 and state.net_profit >= CONFIG['TAKE_PROFIT']:
+        clear_line()
+        net_str = format_rupiah(state.net_profit)
+        target_str = format_rupiah(CONFIG['TAKE_PROFIT'])
+        print(f"\n✅ TAKE PROFIT! Profit: +{net_str} (target: +{target_str})")
+        print(f"   Saldo sekarang: {format_rupiah(state.balance)}")
+        should_stop = take_profit_countdown(CONFIG['TAKE_PROFIT_DELAY_SEC'])
+        if should_stop:
+            return True
+        # Jika dibatalkan, geser target +TAKE_PROFIT agar tidak langsung trigger lagi
+        # (tetap di posisi profit saat ini sebagai baseline baru)
+        state.initial_balance = state.balance - CONFIG['TAKE_PROFIT'] + 1
+        return False
+
     # Wager target
     if CONFIG['WAGER_TARGET'] > 0 and state.total_wagered >= CONFIG['WAGER_TARGET']:
         clear_line()
@@ -335,10 +386,10 @@ def check_stop_conditions():
         return True
 
     # Stop loss
-    if state.balance > 0 and state.balance <= CONFIG['STOP_LOSS']:
+    if CONFIG['STOP_LOSS'] > 0 and state.balance > 0 and state.balance <= CONFIG['STOP_LOSS']:
         clear_line()
         print(f"\n🛑 STOP LOSS tercapai!")
-        print(f"   Saldo   : {format_rupiah(state.balance)}")
+        print(f"   Saldo    : {format_rupiah(state.balance)}")
         print(f"   Threshold: {format_rupiah(CONFIG['STOP_LOSS'])}")
         return True
 
@@ -388,7 +439,11 @@ def main():
         print("❌ Gagal mengambil saldo. Periksa token dan koneksi.")
         sys.exit(1)
 
+    state.initial_balance = initial_balance
     print(f"✅ Saldo awal: {format_rupiah(initial_balance)} {CONFIG['CURRENCY']}")
+    if CONFIG['TAKE_PROFIT'] > 0:
+        target_balance = initial_balance + CONFIG['TAKE_PROFIT']
+        print(f"🎯 Target saldo: {format_rupiah(target_balance)} (+{format_rupiah(CONFIG['TAKE_PROFIT'])})")
 
     if check_stop_conditions():
         print_final_stats()
