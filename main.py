@@ -95,12 +95,25 @@ def _parse_env():
     if max_retries < 1:
         errors.append(f"MAX_RATE_LIMIT_RETRIES={max_retries} harus minimal 1.")
 
+    currency_raw = os.getenv('CURRENCY', 'IDR')
+    currency_enum = currency_raw.lower()  # Stake API pakai lowercase enum: idr/btc/eth
+
+    # Log file — 'auto' = generate nama otomatis, 'NONE' = nonaktif
+    log_file_raw = os.getenv('LOG_FILE', 'auto').strip()
+    if log_file_raw.upper() == 'NONE':
+        log_file = ''
+    elif log_file_raw.lower() == 'auto':
+        log_file = datetime.now().strftime('plinko_%Y%m%d_%H%M%S.csv')
+    else:
+        log_file = log_file_raw
+
+    log_max_lines = get_int('LOG_MAX_LINES', 1000)
+    if log_max_lines < 10:
+        errors.append(f"LOG_MAX_LINES={log_max_lines} harus minimal 10.")
+
     if errors:
         msg = "\n".join(f"  ❌ {e}" for e in errors)
         raise ValueError(f"\nKesalahan konfigurasi .env:\n{msg}\n\nPerbaiki file .env lalu jalankan ulang.")
-
-    currency_raw = os.getenv('CURRENCY', 'IDR')
-    currency_enum = currency_raw.lower()  # Stake API pakai lowercase enum: idr/btc/eth
 
     return {
         'STAKE_API_TOKEN': os.getenv('STAKE_API_TOKEN', ''),
@@ -122,6 +135,8 @@ def _parse_env():
         'MAX_CONSECUTIVE_ERRORS': max_errors,
         'MAX_RATE_LIMIT_RETRIES': max_retries,
         'GRAPHQL_URL': os.getenv('GRAPHQL_URL', 'https://stake.com/_api/graphql'),
+        'LOG_FILE': log_file,
+        'LOG_MAX_LINES': log_max_lines,
     }
 
 try:
@@ -152,6 +167,64 @@ class State:
         return self.balance - self.initial_balance
 
 state = State()
+
+# ==================== LOG FILE ====================
+
+_LOG_HEADER = 'timestamp,bet_id,amount,payout,multiplier,profit,balance\n'
+
+def init_log_file():
+    """Buat file log CSV dengan header jika belum ada. Cetak path-nya."""
+    if not CONFIG['LOG_FILE']:
+        return
+    try:
+        if not os.path.exists(CONFIG['LOG_FILE']):
+            with open(CONFIG['LOG_FILE'], 'w', encoding='utf-8') as f:
+                f.write(_LOG_HEADER)
+        print(f"📄 Log  : {CONFIG['LOG_FILE']} (max {CONFIG['LOG_MAX_LINES']} baris, auto-trim)")
+    except Exception as e:
+        print(f"⚠️ Gagal buat log file: {e}")
+
+def append_log(result: dict):
+    """Tambah satu baris ke log. Tidak ada I/O jika LOG_FILE kosong."""
+    if not CONFIG['LOG_FILE']:
+        return
+    try:
+        ts  = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        amt = result.get('amount', 0)
+        payout = amt + result.get('profit', 0)
+        line = (
+            f"{ts},"
+            f"{result.get('bet_id', '')},"
+            f"{amt:.2f},"
+            f"{payout:.2f},"
+            f"{result.get('multiplier', 0):.4f},"
+            f"{result.get('profit', 0):.2f},"
+            f"{result.get('balance', 0):.2f}\n"
+        )
+        with open(CONFIG['LOG_FILE'], 'a', encoding='utf-8') as f:
+            f.write(line)
+    except Exception:
+        pass  # jangan sampai error log menghentikan bot
+
+def trim_log_if_needed():
+    """
+    Potong log ke LOG_MAX_LINES baris data terakhir + header.
+    Dipanggil setiap 100 bet agar I/O minimal dan tidak menghambat kecepatan.
+    """
+    if not CONFIG['LOG_FILE']:
+        return
+    try:
+        with open(CONFIG['LOG_FILE'], 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        # lines[0] = header, lines[1:] = data
+        max_data = CONFIG['LOG_MAX_LINES']
+        if len(lines) <= max_data + 1:
+            return  # belum perlu trim
+        trimmed = [lines[0]] + lines[-max_data:]
+        with open(CONFIG['LOG_FILE'], 'w', encoding='utf-8') as f:
+            f.writelines(trimmed)
+    except Exception:
+        pass
 
 # ==================== LOGIKA STRATEGI ====================
 
@@ -382,14 +455,18 @@ def format_rupiah(amount):
 def update_status(result=None):
     """Update status di konsol (baris yang sama)"""
     elapsed = datetime.now() - state.start_time
-    minutes = int(elapsed.total_seconds() // 60)
-    seconds = int(elapsed.total_seconds() % 60)
+    elapsed_sec = elapsed.total_seconds()
+    minutes = int(elapsed_sec // 60)
+    seconds = int(elapsed_sec % 60)
+
+    # Bets per menit — hindari pembagian nol di detik-detik pertama
+    bpm = (state.total_bets / elapsed_sec * 60) if elapsed_sec >= 5 else 0
 
     balance_str = format_rupiah(state.balance)
     wagered_str = format_rupiah(state.total_wagered)
 
     status = (
-        f"🎯 Bets: {state.total_bets} | "
+        f"🎯 Bets: {state.total_bets} ({bpm:.0f}/min) | "
         f"Wager: {wagered_str} | "
         f"Balance: {balance_str} | "
         f"Time: {minutes}m{seconds}s"
@@ -549,6 +626,7 @@ def main():
         print_final_stats()
         sys.exit(0)
 
+    init_log_file()
     print("\n🚀 Memulai auto-bet... (tekan Ctrl+C untuk berhenti)\n")
 
     iteration = 0
@@ -594,6 +672,11 @@ def main():
 
             result['balance'] = state.balance
             update_status(result)
+            append_log(result)
+
+            # Trim log setiap 100 bet agar file tidak membengkak
+            if state.total_bets % 100 == 0:
+                trim_log_if_needed()
 
             if check_stop_conditions():
                 state.is_running = False
