@@ -219,7 +219,15 @@ def get_headers():
     return {
         'Content-Type': 'application/json',
         'x-access-token': CONFIG['STAKE_API_TOKEN'],
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/125.0.0.0 Safari/537.36'
+        ),
+        'Origin': 'https://stake.com',
+        'Referer': 'https://stake.com/',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
     }
 
 def get_balance():
@@ -240,7 +248,12 @@ def get_balance():
         )
 
         if response.status_code != 200:
-            print(f"⚠️ Gagal cek balance: HTTP {response.status_code}")
+            if response.status_code == 403:
+                print("⚠️ HTTP 403: Token ditolak server.")
+                print("   → Token mungkin sudah expired. Ambil token baru dari browser.")
+                print("   → Buka Stake.com → F12 → Network → cari x-access-token di request header.")
+            else:
+                print(f"⚠️ Gagal cek balance: HTTP {response.status_code}")
             return None
 
         data = response.json()
