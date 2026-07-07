@@ -211,7 +211,7 @@ query GetBalance {
   user {
     id
     balances {
-      payout {
+      available {
         amount
         currency
       }
@@ -247,10 +247,7 @@ def get_balance():
     try:
         response = requests.post(
             CONFIG['GRAPHQL_URL'],
-            json={
-                'query': BALANCE_QUERY,
-                'variables': {'currency': CONFIG['CURRENCY']},
-            },
+            json={'query': BALANCE_QUERY},
             headers=get_headers(),
             timeout=10
         )
@@ -271,14 +268,14 @@ def get_balance():
             print(f"⚠️ GraphQL error saat cek balance: {error_msg}")
             return None
 
-        # Response: data.user.balances[].payout.{amount, currency}
+        # Response: data.user.balances[].available.{amount, currency}
         # Filter sesuai currency yang dikonfigurasi (lowercase)
         balances = data.get('data', {}).get('user', {}).get('balances', [])
         target_currency = CONFIG['CURRENCY_ENUM']  # e.g. 'idr'
         for b in balances:
-            payout = b.get('payout', {})
-            if payout.get('currency', '').lower() == target_currency:
-                balance = float(payout.get('amount', 0))
+            available = b.get('available', {})
+            if available.get('currency', '').lower() == target_currency:
+                balance = float(available.get('amount', 0))
                 state.balance = balance
                 return balance
 
@@ -581,18 +578,19 @@ def main():
                     state.is_running = False
                     break
 
-                print(f"⏳ Menunggu 5 detik sebelum retry...")
+                # Refresh balance dari API setelah error agar stop-loss tidak keputusan salah
+                # (bet mungkin sudah masuk server tapi response timeout/connection error)
+                print(f"⏳ Menunggu 5 detik lalu verifikasi saldo...")
                 time.sleep(5)
+                get_balance()
                 continue  # skip delay normal, langsung retry
 
-            # Hitung bet berikutnya berdasarkan hasil (sebelum refresh balance)
+            # Hitung bet berikutnya berdasarkan hasil
             state.current_bet = calculate_next_bet(result.get('profit', 0))
 
-            # Refresh balance setelah setiap bet agar stop-loss akurat
-            fetched = get_balance()
-            if fetched is None:
-                # Estimasi dari profit bet terakhir supaya tidak buta sama sekali
-                state.balance += result.get('profit', 0)
+            # Update balance lokal dari profit bet — tanpa HTTP request tambahan
+            # Balance API di-refresh setiap 5 bet (di atas) agar tetap akurat
+            state.balance += result.get('profit', 0)
 
             result['balance'] = state.balance
             update_status(result)
