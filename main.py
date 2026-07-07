@@ -12,37 +12,93 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== KONFIGURASI ====================
-CONFIG = {
-    # API Token dari Stake.com
-    'STAKE_API_TOKEN': os.getenv('STAKE_API_TOKEN', ''),
-    
-    # Pengaturan Game
-    'RISK': 'LOW',
-    'ROWS': 8,
-    'BET_AMOUNT': 500,  # 500 IDR
-    'CURRENCY': 'IDR',
-    
-    # Delay antar bet (ms)
-    'BASE_DELAY_MS': 200,
-    
-    # Stop Loss (dalam IDR) - berhenti jika saldo turun ke angka ini
-    'STOP_LOSS': float(os.getenv('STOP_LOSS', '10000')),  # default 10,000 IDR
-    
-    # Target wager (opsional, 0 = unlimited)
-    'WAGER_TARGET': float(os.getenv('WAGER_TARGET', '0')),
-    
-    # GraphQL Endpoint
-    'GRAPHQL_URL': 'https://stake.com/_api/graphql',
-}
+
+VALID_RISKS = {'LOW', 'MEDIUM', 'HIGH'}
+VALID_ROWS = set(range(8, 17))  # 8–16
+
+def _parse_env():
+    """Parse dan validasi semua env var. Raise ValueError dengan pesan jelas jika ada yang salah."""
+    errors = []
+
+    def get_float(key, default):
+        val = os.getenv(key, str(default))
+        try:
+            return float(val)
+        except ValueError:
+            errors.append(f"{key}='{val}' bukan angka desimal yang valid.")
+            return default
+
+    def get_int(key, default):
+        val = os.getenv(key, str(default))
+        try:
+            return int(val)
+        except ValueError:
+            errors.append(f"{key}='{val}' bukan bilangan bulat yang valid.")
+            return default
+
+    risk = os.getenv('RISK', 'LOW').upper()
+    if risk not in VALID_RISKS:
+        errors.append(f"RISK='{risk}' tidak valid. Pilihan: LOW, MEDIUM, HIGH.")
+
+    rows = get_int('ROWS', 8)
+    if rows not in VALID_ROWS:
+        errors.append(f"ROWS={rows} tidak valid. Pilihan: 8 hingga 16.")
+
+    bet_amount = get_float('BET_AMOUNT', 500)
+    if bet_amount <= 0:
+        errors.append(f"BET_AMOUNT={bet_amount} harus lebih dari 0.")
+
+    base_delay = get_int('BASE_DELAY_MS', 200)
+    if base_delay < 0:
+        errors.append(f"BASE_DELAY_MS={base_delay} tidak boleh negatif.")
+
+    stop_loss = get_float('STOP_LOSS', 10000)
+    if stop_loss < 0:
+        errors.append(f"STOP_LOSS={stop_loss} tidak boleh negatif.")
+
+    wager_target = get_float('WAGER_TARGET', 0)
+    if wager_target < 0:
+        errors.append(f"WAGER_TARGET={wager_target} tidak boleh negatif.")
+
+    max_errors = get_int('MAX_CONSECUTIVE_ERRORS', 5)
+    if max_errors < 1:
+        errors.append(f"MAX_CONSECUTIVE_ERRORS={max_errors} harus minimal 1.")
+
+    max_retries = get_int('MAX_RATE_LIMIT_RETRIES', 10)
+    if max_retries < 1:
+        errors.append(f"MAX_RATE_LIMIT_RETRIES={max_retries} harus minimal 1.")
+
+    if errors:
+        msg = "\n".join(f"  ❌ {e}" for e in errors)
+        raise ValueError(f"\nKesalahan konfigurasi .env:\n{msg}\n\nPerbaiki file .env lalu jalankan ulang.")
+
+    return {
+        'STAKE_API_TOKEN': os.getenv('STAKE_API_TOKEN', ''),
+        'RISK': risk,
+        'ROWS': rows,
+        'BET_AMOUNT': bet_amount,
+        'CURRENCY': os.getenv('CURRENCY', 'IDR'),
+        'BASE_DELAY_MS': base_delay,
+        'STOP_LOSS': stop_loss,
+        'WAGER_TARGET': wager_target,
+        'MAX_CONSECUTIVE_ERRORS': max_errors,
+        'MAX_RATE_LIMIT_RETRIES': max_retries,
+        'GRAPHQL_URL': os.getenv('GRAPHQL_URL', 'https://stake.com/_api/graphql'),
+    }
+
+try:
+    CONFIG = _parse_env()
+except ValueError as _cfg_err:
+    print(_cfg_err)
+    sys.exit(1)
 
 # ==================== STATE ====================
 class State:
     def __init__(self):
-        self.balance = 0
-        self.total_wagered = 0
+        self.balance = 0.0
+        self.total_wagered = 0.0
         self.total_bets = 0
         self.is_running = True
-        self.rate_limit_retries = 0
         self.consecutive_errors = 0
         self.start_time = datetime.now()
         self.bet_results = []
@@ -69,10 +125,10 @@ mutation PlinkoBet($input: PlinkoBetInput!) {
 """
 
 BALANCE_QUERY = """
-query GetBalance {
+query GetBalance($currency: CurrencyEnum!) {
   me {
     id
-    balances(currency: "IDR") {
+    balances(currency: $currency) {
       currency
       amount
     }
@@ -91,36 +147,55 @@ def get_headers():
     }
 
 def get_balance():
-    """Cek saldo IDR dari akun Stake"""
+    """Cek saldo dari akun Stake. Return balance atau None jika gagal."""
     if not CONFIG['STAKE_API_TOKEN']:
         print("❌ STAKE_API_TOKEN tidak ditemukan!")
-        return 0
+        return None
 
     try:
         response = requests.post(
             CONFIG['GRAPHQL_URL'],
-            json={'query': BALANCE_QUERY},
+            json={
+                'query': BALANCE_QUERY,
+                'variables': {'currency': CONFIG['CURRENCY']},
+            },
             headers=get_headers(),
             timeout=10
         )
-        
-        if response.status_code == 200:
-            data = response.json()
-            balances = data.get('data', {}).get('me', {}).get('balances', [])
-            if balances:
-                balance = float(balances[0].get('amount', 0))
-                state.balance = balance
-                return balance
-        else:
+
+        if response.status_code != 200:
             print(f"⚠️ Gagal cek balance: HTTP {response.status_code}")
-            return state.balance or 0
-            
+            return None
+
+        data = response.json()
+
+        if 'errors' in data:
+            error_msg = data['errors'][0].get('message', 'Unknown GraphQL error')
+            print(f"⚠️ GraphQL error saat cek balance: {error_msg}")
+            return None
+
+        balances = data.get('data', {}).get('me', {}).get('balances', [])
+        if balances:
+            balance = float(balances[0].get('amount', 0))
+            state.balance = balance
+            return balance
+
+        print("⚠️ Respons balance kosong.")
+        return None
+
+    except requests.exceptions.Timeout:
+        print("⚠️ Timeout saat cek balance.")
+        return None
     except Exception as e:
         print(f"⚠️ Error cek balance: {str(e)}")
-        return state.balance or 0
+        return None
 
 def place_plinko_bet():
-    """Melakukan satu taruhan Plinko"""
+    """
+    Melakukan satu taruhan Plinko.
+    Rate-limit retry dilakukan secara iteratif (bukan rekursif).
+    Raise Exception jika gagal.
+    """
     if not CONFIG['STAKE_API_TOKEN']:
         raise Exception('STAKE_API_TOKEN tidak ditemukan')
 
@@ -133,37 +208,42 @@ def place_plinko_bet():
         }
     }
 
-    try:
-        response = requests.post(
-            CONFIG['GRAPHQL_URL'],
-            json={
-                'query': PLINKO_BET_MUTATION,
-                'variables': variables
-            },
-            headers=get_headers(),
-            timeout=15
-        )
+    rate_limit_retries = 0
 
-        # Handle rate limit (429)
+    while True:
+        try:
+            response = requests.post(
+                CONFIG['GRAPHQL_URL'],
+                json={
+                    'query': PLINKO_BET_MUTATION,
+                    'variables': variables
+                },
+                headers=get_headers(),
+                timeout=15
+            )
+        except requests.exceptions.Timeout:
+            raise Exception('Timeout - koneksi lambat')
+        except requests.exceptions.ConnectionError:
+            raise Exception('Connection error - periksa internet')
+
+        # Handle rate limit (429) - iteratif, bukan rekursif
         if response.status_code == 429:
+            rate_limit_retries += 1
+            if rate_limit_retries > CONFIG['MAX_RATE_LIMIT_RETRIES']:
+                raise Exception(f'Rate limit: sudah retry {rate_limit_retries} kali, berhenti.')
+
             retry_after = int(response.headers.get('retry-after', 5))
             wait_time = max(retry_after, 5)
-            
-            state.rate_limit_retries += 1
-            print(f"\n⚠️ Rate limit (429) terdeteksi. Menunggu {wait_time} detik... (retry #{state.rate_limit_retries})")
+            print(f"\n⚠️ Rate limit (429). Menunggu {wait_time}s... (retry #{rate_limit_retries}/{CONFIG['MAX_RATE_LIMIT_RETRIES']})")
             time.sleep(wait_time)
-            
-            if state.rate_limit_retries <= 10:
-                return place_plinko_bet()
-            else:
-                raise Exception('Terlalu banyak rate limit retry')
+            continue  # ulangi request
 
-        # Handle error lainnya
+        # Handle error HTTP lainnya
         if response.status_code != 200:
             raise Exception(f'HTTP {response.status_code}: {response.text[:200]}')
 
         data = response.json()
-        
+
         # Cek error GraphQL
         if 'errors' in data:
             error_msg = data['errors'][0].get('message', 'Unknown GraphQL error')
@@ -172,40 +252,28 @@ def place_plinko_bet():
         # Ekstrak data bet
         bet_data = data.get('data', {}).get('plinkoBet')
         if not bet_data:
-            raise Exception('Invalid response structure')
+            raise Exception('Invalid response structure: plinkoBet tidak ditemukan')
+
+        bet = bet_data.get('bet', {})
+        if not bet:
+            raise Exception('Invalid response structure: bet tidak ditemukan')
 
         # Update state
-        bet = bet_data.get('bet', {})
         state.total_bets += 1
-        state.total_wagered += float(bet.get('amount', 0))
-        
-        # Update balance jika ada
-        if 'balance' in bet_data:
-            state.balance = float(bet_data.get('balance', {}).get('amount', state.balance))
+        amount = float(bet.get('amount', 0))
+        state.total_wagered += amount
 
-        # Reset error counter
-        state.consecutive_errors = 0
-        state.rate_limit_retries = 0
-
-        # Simpan hasil
         result = {
             'bet_id': bet.get('id'),
-            'amount': float(bet.get('amount', 0)),
-            'currency': bet.get('currency', 'IDR'),
+            'amount': amount,
+            'currency': bet.get('currency', CONFIG['CURRENCY']),
             'multiplier': float(bet.get('payoutMultiplier', 0)),
             'profit': float(bet.get('profit', 0)),
-            'balance': state.balance,
+            'balance': state.balance,  # balance diupdate dari get_balance()
         }
         state.bet_results.append(result)
-        
-        return result
 
-    except requests.exceptions.Timeout:
-        raise Exception('Timeout - koneksi lambat')
-    except requests.exceptions.ConnectionError:
-        raise Exception('Connection error - periksa internet')
-    except Exception as e:
-        raise Exception(f'Error: {str(e)}')
+        return result
 
 def format_rupiah(amount):
     """Format angka ke Rupiah"""
@@ -216,23 +284,23 @@ def update_status(result=None):
     elapsed = datetime.now() - state.start_time
     minutes = int(elapsed.total_seconds() // 60)
     seconds = int(elapsed.total_seconds() % 60)
-    
+
     balance_str = format_rupiah(state.balance)
     wagered_str = format_rupiah(state.total_wagered)
-    
-    # Status message
-    status = f"🎯 Bets: {state.total_bets} | Wager: {wagered_str} | Balance: {balance_str} | Time: {minutes}m{seconds}s"
-    
+
+    status = (
+        f"🎯 Bets: {state.total_bets} | "
+        f"Wager: {wagered_str} | "
+        f"Balance: {balance_str} | "
+        f"Time: {minutes}m{seconds}s"
+    )
+
     if result:
         profit = result.get('profit', 0)
         multiplier = result.get('multiplier', 0)
         profit_str = f"+{format_rupiah(profit)}" if profit > 0 else format_rupiah(profit)
         status += f" | Last: {profit_str} (x{multiplier:.2f})"
-    
-    if state.rate_limit_retries > 0:
-        status += f" | ⚠️ Retry: {state.rate_limit_retries}x"
-    
-    # Print dengan carriage return untuk update di baris yang sama
+
     print(f"\r{status}", end='', flush=True)
 
 def clear_line():
@@ -242,107 +310,144 @@ def clear_line():
 
 def print_header():
     """Print header info"""
-    print("\n" + "="*50)
-    print("🎰 P L I N K O   A U T O - B E T")
-    print("="*50)
-    print(f"⚙️  Risk: {CONFIG['RISK']}")
-    print(f"📊 Rows: {CONFIG['ROWS']}")
-    print(f"💰 Bet: {format_rupiah(CONFIG['BET_AMOUNT'])}")
+    print("\n" + "="*55)
+    print("🎰  P L I N K O   A U T O - B E T")
+    print("="*55)
+    print(f"⚙️  Risk     : {CONFIG['RISK']}")
+    print(f"📊 Rows     : {CONFIG['ROWS']}")
+    print(f"💰 Bet      : {format_rupiah(CONFIG['BET_AMOUNT'])}")
     print(f"🛑 Stop Loss: {format_rupiah(CONFIG['STOP_LOSS'])}")
-    print(f"⏱️  Delay: {CONFIG['BASE_DELAY_MS']}ms")
-    print("="*50)
+    if CONFIG['WAGER_TARGET'] > 0:
+        print(f"🎯 Wager Target: {format_rupiah(CONFIG['WAGER_TARGET'])}")
+    print(f"⏱️  Delay    : {CONFIG['BASE_DELAY_MS']}ms")
+    print("="*55)
+
+def check_stop_conditions():
+    """
+    Cek kondisi stop loss dan wager target.
+    Return True jika harus berhenti.
+    """
+    # Wager target
+    if CONFIG['WAGER_TARGET'] > 0 and state.total_wagered >= CONFIG['WAGER_TARGET']:
+        clear_line()
+        print(f"\n🎯 Wager target tercapai!")
+        print(f"   Total wagered: {format_rupiah(state.total_wagered)}")
+        return True
+
+    # Stop loss
+    if state.balance > 0 and state.balance <= CONFIG['STOP_LOSS']:
+        clear_line()
+        print(f"\n🛑 STOP LOSS tercapai!")
+        print(f"   Saldo   : {format_rupiah(state.balance)}")
+        print(f"   Threshold: {format_rupiah(CONFIG['STOP_LOSS'])}")
+        return True
+
+    return False
+
+def print_final_stats():
+    """Print statistik akhir"""
+    print("\n" + "="*55)
+    print("📊  S T A T I S T I K   A K H I R")
+    print("="*55)
+    elapsed = datetime.now() - state.start_time
+    minutes = int(elapsed.total_seconds() // 60)
+    seconds = int(elapsed.total_seconds() % 60)
+
+    print(f"⏱️  Durasi        : {minutes}m {seconds}s")
+    print(f"🎯 Total Bets    : {state.total_bets}")
+    print(f"💰 Total Wagered : {format_rupiah(state.total_wagered)}")
+    print(f"💳 Final Balance : {format_rupiah(state.balance)}")
+
+    if state.total_bets > 0:
+        win_count = sum(1 for r in state.bet_results if r.get('profit', 0) > 0)
+        win_rate = (win_count / state.total_bets) * 100
+        net_profit = sum(r.get('profit', 0) for r in state.bet_results)
+        profit_str = f"+{format_rupiah(net_profit)}" if net_profit >= 0 else format_rupiah(net_profit)
+        print(f"📈 Win Rate      : {win_rate:.1f}% ({win_count}/{state.total_bets})")
+        print(f"💹 Net Profit    : {profit_str}")
+
+    print("="*55)
+    print("👋 Script selesai.")
 
 def main():
     """Main loop"""
     print_header()
-    
-    # Cek token
+
+    # Validasi token
     if not CONFIG['STAKE_API_TOKEN']:
         print("\n❌ ERROR: STAKE_API_TOKEN tidak ditemukan!")
         print("📌 Buat file .env dan isi: STAKE_API_TOKEN=your_token_here")
-        print("📌 Cara dapat token: buka Stake.com → F12 → Network → cari request ke _api")
+        print("📌 Atau jalankan: bash setup.sh")
+        print("📌 Cara dapat token: buka Stake.com → F12 → Network → cari x-access-token di request header")
         sys.exit(1)
-    
+
     # Ambil saldo awal
     print("🔄 Mengambil saldo awal...")
     initial_balance = get_balance()
-    print(f"✅ Saldo awal: {format_rupiah(initial_balance)} IDR")
-    
-    if initial_balance <= CONFIG['STOP_LOSS']:
-        print(f"\n❌ Stop Loss tercapai!")
-        print(f"   Saldo: {format_rupiah(initial_balance)}")
-        print(f"   Threshold: {format_rupiah(CONFIG['STOP_LOSS'])}")
+    if initial_balance is None:
+        print("❌ Gagal mengambil saldo. Periksa token dan koneksi.")
+        sys.exit(1)
+
+    print(f"✅ Saldo awal: {format_rupiah(initial_balance)} {CONFIG['CURRENCY']}")
+
+    if check_stop_conditions():
+        print_final_stats()
         sys.exit(0)
-    
+
     print("\n🚀 Memulai auto-bet... (tekan Ctrl+C untuk berhenti)\n")
-    
-    # Main loop
+
     iteration = 0
     try:
         while state.is_running:
-            # Cek stop loss setiap 5 bets
+            # Cek stop conditions setiap 5 bet (dan update balance)
             if iteration > 0 and iteration % 5 == 0:
-                get_balance()
-                if state.balance <= CONFIG['STOP_LOSS']:
-                    clear_line()
-                    print(f"\n🛑 STOP LOSS tercapai!")
-                    print(f"   Saldo: {format_rupiah(state.balance)}")
-                    print(f"   Threshold: {format_rupiah(CONFIG['STOP_LOSS'])}")
+                fetched = get_balance()
+                if fetched is None:
+                    print("\n⚠️ Gagal fetch balance, menggunakan nilai terakhir.")
+                if check_stop_conditions():
                     state.is_running = False
                     break
-            
-            # Cek wager target
-            if CONFIG['WAGER_TARGET'] > 0 and state.total_wagered >= CONFIG['WAGER_TARGET']:
+
+            # Place bet
+            try:
+                result = place_plinko_bet()
+                state.consecutive_errors = 0  # reset setelah bet berhasil
+            except Exception as e:
+                state.consecutive_errors += 1
                 clear_line()
-                print(f"\n🎯 Wager target tercapai!")
-                print(f"   Total wagered: {format_rupiah(state.total_wagered)}")
+                print(f"\n❌ Error bet #{state.total_bets + 1}: {str(e)}")
+                print(f"   Consecutive errors: {state.consecutive_errors}/{CONFIG['MAX_CONSECUTIVE_ERRORS']}")
+
+                if state.consecutive_errors >= CONFIG['MAX_CONSECUTIVE_ERRORS']:
+                    print("🛑 Terlalu banyak error berturut-turut. Menghentikan script.")
+                    state.is_running = False
+                    break
+
+                print(f"⏳ Menunggu 5 detik sebelum retry...")
+                time.sleep(5)
+                continue  # skip delay normal, langsung retry
+
+            # Refresh balance setelah setiap bet agar stop-loss akurat
+            fetched = get_balance()
+            if fetched is None:
+                # Estimasi dari profit bet terakhir supaya tidak buta sama sekali
+                state.balance += result.get('profit', 0)
+
+            result['balance'] = state.balance
+            update_status(result)
+
+            if check_stop_conditions():
                 state.is_running = False
                 break
-            
-            # Place bet
-            result = place_plinko_bet()
-            update_status(result)
-            
-            # Delay
+
+            # Delay antar bet
             time.sleep(CONFIG['BASE_DELAY_MS'] / 1000.0)
             iteration += 1
-            
+
     except KeyboardInterrupt:
         print("\n\n⏹️  Script dihentikan oleh user (Ctrl+C)")
-    except Exception as e:
-        clear_line()
-        print(f"\n❌ Error: {str(e)}")
-        state.consecutive_errors += 1
-        
-        if state.consecutive_errors > 5:
-            print("🛑 Terlalu banyak error. Menghentikan script.")
-            state.is_running = False
-        else:
-            print(f"⏳ Retry dalam 5 detik... ({state.consecutive_errors}/5)")
-            time.sleep(5)
-            if state.is_running:
-                return main()  # Restart loop
-    
-    # Final statistics
-    print("\n" + "="*50)
-    print("📊 S T A T I S T I K   A K H I R")
-    print("="*50)
-    elapsed = datetime.now() - state.start_time
-    minutes = int(elapsed.total_seconds() // 60)
-    seconds = int(elapsed.total_seconds() % 60)
-    
-    print(f"⏱️  Durasi: {minutes}m {seconds}s")
-    print(f"🎯 Total Bets: {state.total_bets}")
-    print(f"💰 Total Wagered: {format_rupiah(state.total_wagered)}")
-    print(f"💳 Final Balance: {format_rupiah(state.balance)}")
-    
-    if state.total_bets > 0:
-        win_count = sum(1 for r in state.bet_results if r.get('profit', 0) > 0)
-        win_rate = (win_count / state.total_bets) * 100
-        print(f"📈 Win Rate: {win_rate:.1f}% ({win_count}/{state.total_bets})")
-    
-    print("="*50)
-    print("👋 Script selesai.")
+
+    print_final_stats()
 
 if __name__ == "__main__":
     main()
