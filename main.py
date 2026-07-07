@@ -68,6 +68,24 @@ def _parse_env():
     if take_profit_delay < 0:
         errors.append(f"TAKE_PROFIT_DELAY_SEC={take_profit_delay} tidak boleh negatif.")
 
+    # --- Strategi betting ---
+    valid_strategies = {'FLAT', 'ANTI_MARTINGALE'}
+    strategy = os.getenv('STRATEGY', 'FLAT').upper()
+    if strategy not in valid_strategies:
+        errors.append(f"STRATEGY='{strategy}' tidak valid. Pilihan: FLAT, ANTI_MARTINGALE.")
+
+    bet_multiplier = get_float('BET_MULTIPLIER', 2.0)
+    if bet_multiplier <= 1.0:
+        errors.append(f"BET_MULTIPLIER={bet_multiplier} harus lebih dari 1 (contoh: 2).")
+
+    win_streak_cap = get_int('WIN_STREAK_CAP', 3)
+    if win_streak_cap < 1:
+        errors.append(f"WIN_STREAK_CAP={win_streak_cap} harus minimal 1.")
+
+    max_bet = get_float('MAX_BET', 0)  # 0 = tidak ada batas
+    if max_bet < 0:
+        errors.append(f"MAX_BET={max_bet} tidak boleh negatif.")
+
     max_errors = get_int('MAX_CONSECUTIVE_ERRORS', 5)
     if max_errors < 1:
         errors.append(f"MAX_CONSECUTIVE_ERRORS={max_errors} harus minimal 1.")
@@ -84,13 +102,17 @@ def _parse_env():
         'STAKE_API_TOKEN': os.getenv('STAKE_API_TOKEN', ''),
         'RISK': risk,
         'ROWS': rows,
-        'BET_AMOUNT': bet_amount,
+        'BET_AMOUNT': bet_amount,       # bet dasar (selalu jadi acuan reset)
         'CURRENCY': os.getenv('CURRENCY', 'IDR'),
         'BASE_DELAY_MS': base_delay,
         'STOP_LOSS': stop_loss,
         'WAGER_TARGET': wager_target,
         'TAKE_PROFIT': take_profit,
         'TAKE_PROFIT_DELAY_SEC': take_profit_delay,
+        'STRATEGY': strategy,
+        'BET_MULTIPLIER': bet_multiplier,
+        'WIN_STREAK_CAP': win_streak_cap,
+        'MAX_BET': max_bet,
         'MAX_CONSECUTIVE_ERRORS': max_errors,
         'MAX_RATE_LIMIT_RETRIES': max_retries,
         'GRAPHQL_URL': os.getenv('GRAPHQL_URL', 'https://stake.com/_api/graphql'),
@@ -113,6 +135,9 @@ class State:
         self.consecutive_errors = 0
         self.start_time = datetime.now()
         self.bet_results = []
+        # Strategi
+        self.current_bet = CONFIG['BET_AMOUNT']  # bet aktif saat ini
+        self.win_streak = 0                       # berapa kali menang berturut-turut
 
     @property
     def net_profit(self):
@@ -120,6 +145,41 @@ class State:
         return self.balance - self.initial_balance
 
 state = State()
+
+# ==================== LOGIKA STRATEGI ====================
+
+def calculate_next_bet(last_profit: float) -> float:
+    """
+    Hitung nominal bet berikutnya berdasarkan hasil bet terakhir.
+
+    FLAT        : selalu BET_AMOUNT.
+    ANTI_MARTINGALE:
+      - Menang  → lipat current_bet × BET_MULTIPLIER, maks WIN_STREAK_CAP kali lipat
+                  dan tidak melampaui MAX_BET (jika diset).
+      - Kalah   → reset ke BET_AMOUNT dasar.
+    """
+    if CONFIG['STRATEGY'] == 'FLAT':
+        return CONFIG['BET_AMOUNT']
+
+    # ANTI_MARTINGALE
+    won = last_profit > 0
+    if won:
+        state.win_streak += 1
+        if state.win_streak >= CONFIG['WIN_STREAK_CAP']:
+            # Sudah mentok cap → reset (ambil profit, mulai lagi dari bawah)
+            state.win_streak = 0
+            return CONFIG['BET_AMOUNT']
+        next_bet = state.current_bet * CONFIG['BET_MULTIPLIER']
+    else:
+        state.win_streak = 0
+        return CONFIG['BET_AMOUNT']
+
+    # Terapkan MAX_BET jika diset
+    if CONFIG['MAX_BET'] > 0 and next_bet > CONFIG['MAX_BET']:
+        next_bet = CONFIG['MAX_BET']
+        state.win_streak = 0  # anggap sudah cap, reset setelah bet ini
+
+    return next_bet
 
 # ==================== GRAPHQL QUERIES ====================
 PLINKO_BET_MUTATION = """
@@ -208,7 +268,7 @@ def get_balance():
 
 def place_plinko_bet():
     """
-    Melakukan satu taruhan Plinko.
+    Melakukan satu taruhan Plinko menggunakan state.current_bet.
     Rate-limit retry dilakukan secara iteratif (bukan rekursif).
     Raise Exception jika gagal.
     """
@@ -219,7 +279,7 @@ def place_plinko_bet():
         'input': {
             'risk': CONFIG['RISK'],
             'rows': CONFIG['ROWS'],
-            'amount': CONFIG['BET_AMOUNT'],
+            'amount': state.current_bet,   # pakai bet aktif dari state
             'currency': CONFIG['CURRENCY'],
         }
     }
@@ -317,6 +377,11 @@ def update_status(result=None):
         profit_str = f"+{format_rupiah(profit)}" if profit > 0 else format_rupiah(profit)
         status += f" | Last: {profit_str} (x{multiplier:.2f})"
 
+    # Tampilkan info strategi Anti-Martingale
+    if CONFIG['STRATEGY'] == 'ANTI_MARTINGALE':
+        streak_bar = "🔥" * state.win_streak if state.win_streak > 0 else "·"
+        status += f" | Bet: {format_rupiah(state.current_bet)} {streak_bar}"
+
     print(f"\r{status}", end='', flush=True)
 
 def clear_line():
@@ -349,13 +414,22 @@ def print_header():
     print("="*55)
     print(f"⚙️  Risk      : {CONFIG['RISK']}")
     print(f"📊 Rows      : {CONFIG['ROWS']}")
-    print(f"💰 Bet       : {format_rupiah(CONFIG['BET_AMOUNT'])}")
+    print(f"💰 Bet Dasar : {format_rupiah(CONFIG['BET_AMOUNT'])}")
     print(f"🛑 Stop Loss : {format_rupiah(CONFIG['STOP_LOSS'])}")
     if CONFIG['TAKE_PROFIT'] > 0:
-        print(f"✅ Take Profit: {format_rupiah(CONFIG['TAKE_PROFIT'])} profit (delay {CONFIG['TAKE_PROFIT_DELAY_SEC']}s)")
+        print(f"✅ Take Profit: +{format_rupiah(CONFIG['TAKE_PROFIT'])} profit (delay {CONFIG['TAKE_PROFIT_DELAY_SEC']}s)")
     if CONFIG['WAGER_TARGET'] > 0:
         print(f"🎯 Wager Target: {format_rupiah(CONFIG['WAGER_TARGET'])}")
     print(f"⏱️  Delay     : {CONFIG['BASE_DELAY_MS']}ms")
+    # Info strategi
+    if CONFIG['STRATEGY'] == 'FLAT':
+        print(f"📐 Strategi  : FLAT (bet selalu tetap)")
+    elif CONFIG['STRATEGY'] == 'ANTI_MARTINGALE':
+        max_bet_str = format_rupiah(CONFIG['MAX_BET']) if CONFIG['MAX_BET'] > 0 else "tidak dibatas"
+        print(f"📐 Strategi  : ANTI-MARTINGALE")
+        print(f"   Pengali   : x{CONFIG['BET_MULTIPLIER']} saat menang")
+        print(f"   Max lipat : {CONFIG['WIN_STREAK_CAP']}x berturut-turut lalu reset")
+        print(f"   Max bet   : {max_bet_str}")
     print("="*55)
 
 def check_stop_conditions():
@@ -481,6 +555,9 @@ def main():
                 print(f"⏳ Menunggu 5 detik sebelum retry...")
                 time.sleep(5)
                 continue  # skip delay normal, langsung retry
+
+            # Hitung bet berikutnya berdasarkan hasil (sebelum refresh balance)
+            state.current_bet = calculate_next_bet(result.get('profit', 0))
 
             # Refresh balance setelah setiap bet agar stop-loss akurat
             fetched = get_balance()

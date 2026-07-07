@@ -72,6 +72,7 @@ success "Dependensi terinstall."
 ENV_FILE=".env"
 OLD_TOKEN="" OLD_RISK="" OLD_ROWS="" OLD_BET="" OLD_CURRENCY=""
 OLD_DELAY="" OLD_STOP_LOSS="" OLD_TAKE_PROFIT="" OLD_TP_DELAY="" OLD_WAGER_TARGET="" OLD_MAX_ERRORS="" OLD_MAX_RETRIES=""
+OLD_STRATEGY="" OLD_BET_MULT="" OLD_WIN_CAP="" OLD_MAX_BET=""
 
 if [ -f "$ENV_FILE" ]; then
     OLD_TOKEN=$(grep -E '^STAKE_API_TOKEN=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
@@ -81,6 +82,10 @@ if [ -f "$ENV_FILE" ]; then
     OLD_CURRENCY=$(grep -E '^CURRENCY=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
     OLD_DELAY=$(grep -E '^BASE_DELAY_MS=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
     OLD_STOP_LOSS=$(grep -E '^STOP_LOSS=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
+    OLD_STRATEGY=$(grep -E '^STRATEGY=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
+    OLD_BET_MULT=$(grep -E '^BET_MULTIPLIER=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
+    OLD_WIN_CAP=$(grep -E '^WIN_STREAK_CAP=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
+    OLD_MAX_BET=$(grep -E '^MAX_BET=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
     OLD_TAKE_PROFIT=$(grep -E '^TAKE_PROFIT=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
     OLD_TP_DELAY=$(grep -E '^TAKE_PROFIT_DELAY_SEC=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
     OLD_WAGER_TARGET=$(grep -E '^WAGER_TARGET=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'" || true)
@@ -164,6 +169,48 @@ CURRENCY=$(prompt_val "CURRENCY (IDR / BTC / ETH / USDT / dll)" "${OLD_CURRENCY:
 CURRENCY=$(echo "$CURRENCY" | tr '[:lower:]' '[:upper:]')
 
 echo ""
+echo "--- Strategi Betting ---"
+echo "  FLAT          = bet selalu tetap (aman, default)"
+echo "  ANTI_MARTINGALE = naik saat menang, reset saat kalah (aman untuk modal kecil)"
+echo ""
+
+while true; do
+    STRATEGY=$(prompt_val "STRATEGY (FLAT / ANTI_MARTINGALE)" "${OLD_STRATEGY:-ANTI_MARTINGALE}")
+    STRATEGY=$(echo "$STRATEGY" | tr '[:lower:]' '[:upper:]')
+    if [[ "$STRATEGY" == "FLAT" || "$STRATEGY" == "ANTI_MARTINGALE" ]]; then break; fi
+    warn "STRATEGY harus FLAT atau ANTI_MARTINGALE."
+done
+
+if [ "$STRATEGY" = "ANTI_MARTINGALE" ]; then
+    while true; do
+        BET_MULTIPLIER=$(prompt_val "BET_MULTIPLIER pengali bet saat menang (> 1, contoh: 2)" "${OLD_BET_MULT:-2}")
+        if is_number "$BET_MULTIPLIER" && is_nonzero "$BET_MULTIPLIER"; then
+            # cek > 1 dengan python3 karena bash tidak handle float
+            if python3 -c "import sys; sys.exit(0 if float('${BET_MULTIPLIER}') > 1 else 1)" 2>/dev/null; then
+                break
+            fi
+        fi
+        warn "BET_MULTIPLIER harus angka lebih dari 1 (contoh: 2 atau 1.5)."
+    done
+
+    while true; do
+        WIN_STREAK_CAP=$(prompt_val "WIN_STREAK_CAP maks lipat berturut-turut sebelum reset (min 1)" "${OLD_WIN_CAP:-3}")
+        if is_integer "$WIN_STREAK_CAP" && [ "$WIN_STREAK_CAP" -ge 1 ]; then break; fi
+        warn "WIN_STREAK_CAP harus bilangan bulat >= 1."
+    done
+
+    while true; do
+        MAX_BET=$(prompt_val "MAX_BET batas atas nominal bet (0 = tidak dibatas)" "${OLD_MAX_BET:-0}")
+        if is_number "$MAX_BET"; then break; fi
+        warn "MAX_BET harus angka >= 0."
+    done
+else
+    BET_MULTIPLIER="${OLD_BET_MULT:-2}"
+    WIN_STREAK_CAP="${OLD_WIN_CAP:-3}"
+    MAX_BET="${OLD_MAX_BET:-0}"
+fi
+
+echo ""
 echo "--- Kontrol Bot ---"
 
 while true; do
@@ -221,6 +268,11 @@ done
     echo "ROWS=${ROWS}"
     echo "BET_AMOUNT=${BET_AMOUNT}"
     echo "CURRENCY=${CURRENCY}"
+    echo ""
+    echo "STRATEGY=${STRATEGY}"
+    echo "BET_MULTIPLIER=${BET_MULTIPLIER}"
+    echo "WIN_STREAK_CAP=${WIN_STREAK_CAP}"
+    echo "MAX_BET=${MAX_BET}"
     echo ""
     echo "BASE_DELAY_MS=${BASE_DELAY_MS}"
     echo "STOP_LOSS=${STOP_LOSS}"
