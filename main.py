@@ -38,6 +38,7 @@ def _parse_env():
     risk = os.getenv('RISK', 'LOW').upper()
     if risk not in VALID_RISKS:
         errors.append(f"RISK='{risk}' tidak valid. Pilihan: LOW, MEDIUM, HIGH.")
+    risk_enum = risk.lower()  # Stake API pakai lowercase enum: low/medium/high
 
     rows = get_int('ROWS', 8)
     if rows not in VALID_ROWS:
@@ -98,12 +99,17 @@ def _parse_env():
         msg = "\n".join(f"  ❌ {e}" for e in errors)
         raise ValueError(f"\nKesalahan konfigurasi .env:\n{msg}\n\nPerbaiki file .env lalu jalankan ulang.")
 
+    currency_raw = os.getenv('CURRENCY', 'IDR')
+    currency_enum = currency_raw.lower()  # Stake API pakai lowercase enum: idr/btc/eth
+
     return {
         'STAKE_API_TOKEN': os.getenv('STAKE_API_TOKEN', ''),
         'RISK': risk,
+        'RISK_ENUM': risk_enum,           # 'low'/'medium'/'high' untuk GraphQL
         'ROWS': rows,
-        'BET_AMOUNT': bet_amount,       # bet dasar (selalu jadi acuan reset)
-        'CURRENCY': os.getenv('CURRENCY', 'IDR'),
+        'BET_AMOUNT': bet_amount,         # bet dasar (selalu jadi acuan reset)
+        'CURRENCY': currency_raw.upper(), # tampilan: IDR
+        'CURRENCY_ENUM': currency_enum,   # untuk GraphQL: idr
         'BASE_DELAY_MS': base_delay,
         'STOP_LOSS': stop_loss,
         'WAGER_TARGET': wager_target,
@@ -183,31 +189,32 @@ def calculate_next_bet(last_profit: float) -> float:
     return next_bet
 
 # ==================== GRAPHQL QUERIES ====================
+# Stake API: plinkoBet pakai argumen langsung (bukan wrapper input:{})
+# currency & risk adalah enum lowercase: idr, low/medium/high
 PLINKO_BET_MUTATION = """
-mutation PlinkoBet($input: PlinkoBetInput!) {
-  plinkoBet(input: $input) {
+mutation PlinkoBet($amount: Float!, $currency: CurrencyEnum!, $rows: Int!, $risk: CasinoGamePlinkoRiskEnum!) {
+  plinkoBet(amount: $amount, currency: $currency, rows: $rows, risk: $risk) {
     id
-    gameId
-    bet {
-      id
-      amount
-      currency
-      payoutMultiplier
-      profit
-      status
-    }
+    amount
+    currency
+    payout
+    payoutMultiplier
     active
   }
 }
 """
 
+# Stake API: field user (bukan me), balance ada di balances[].payout.{amount,currency}
+# Tidak ada argumen filter currency — filter di Python
 BALANCE_QUERY = """
-query GetBalance($currency: CurrencyEnum!) {
-  me {
+query GetBalance {
+  user {
     id
-    balances(currency: $currency) {
-      currency
-      amount
+    balances {
+      payout {
+        amount
+        currency
+      }
     }
   }
 }
@@ -264,13 +271,18 @@ def get_balance():
             print(f"⚠️ GraphQL error saat cek balance: {error_msg}")
             return None
 
-        balances = data.get('data', {}).get('me', {}).get('balances', [])
-        if balances:
-            balance = float(balances[0].get('amount', 0))
-            state.balance = balance
-            return balance
+        # Response: data.user.balances[].payout.{amount, currency}
+        # Filter sesuai currency yang dikonfigurasi (lowercase)
+        balances = data.get('data', {}).get('user', {}).get('balances', [])
+        target_currency = CONFIG['CURRENCY_ENUM']  # e.g. 'idr'
+        for b in balances:
+            payout = b.get('payout', {})
+            if payout.get('currency', '').lower() == target_currency:
+                balance = float(payout.get('amount', 0))
+                state.balance = balance
+                return balance
 
-        print("⚠️ Respons balance kosong.")
+        print(f"⚠️ Saldo {CONFIG['CURRENCY']} tidak ditemukan di akun.")
         return None
 
     except requests.exceptions.Timeout:
@@ -289,13 +301,13 @@ def place_plinko_bet():
     if not CONFIG['STAKE_API_TOKEN']:
         raise Exception('STAKE_API_TOKEN tidak ditemukan')
 
+    # Stake API: argumen langsung (bukan wrapped di input:{})
+    # currency & risk harus lowercase enum
     variables = {
-        'input': {
-            'risk': CONFIG['RISK'],
-            'rows': CONFIG['ROWS'],
-            'amount': state.current_bet,   # pakai bet aktif dari state
-            'currency': CONFIG['CURRENCY'],
-        }
+        'amount': state.current_bet,
+        'currency': CONFIG['CURRENCY_ENUM'],  # 'idr'
+        'rows': CONFIG['ROWS'],
+        'risk': CONFIG['RISK_ENUM'],          # 'low'/'medium'/'high'
     }
 
     rate_limit_retries = 0
@@ -342,27 +354,25 @@ def place_plinko_bet():
             error_msg = data['errors'][0].get('message', 'Unknown GraphQL error')
             raise Exception(f'GraphQL Error: {error_msg}')
 
-        # Ekstrak data bet
+        # Ekstrak data bet — plinkoBet langsung adalah bet-nya (bukan nested)
         bet_data = data.get('data', {}).get('plinkoBet')
         if not bet_data:
             raise Exception('Invalid response structure: plinkoBet tidak ditemukan')
 
-        bet = bet_data.get('bet', {})
-        if not bet:
-            raise Exception('Invalid response structure: bet tidak ditemukan')
-
         # Update state
         state.total_bets += 1
-        amount = float(bet.get('amount', 0))
+        amount     = float(bet_data.get('amount', 0))
+        payout_val = float(bet_data.get('payout', 0))
+        profit     = payout_val - amount   # Stake tidak punya field 'profit', hitung sendiri
         state.total_wagered += amount
 
         result = {
-            'bet_id': bet.get('id'),
-            'amount': amount,
-            'currency': bet.get('currency', CONFIG['CURRENCY']),
-            'multiplier': float(bet.get('payoutMultiplier', 0)),
-            'profit': float(bet.get('profit', 0)),
-            'balance': state.balance,  # balance diupdate dari get_balance()
+            'bet_id':     bet_data.get('id'),
+            'amount':     amount,
+            'currency':   bet_data.get('currency', CONFIG['CURRENCY_ENUM']),
+            'multiplier': float(bet_data.get('payoutMultiplier', 0)),
+            'profit':     profit,
+            'balance':    state.balance,
         }
         state.bet_results.append(result)
 
