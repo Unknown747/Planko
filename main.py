@@ -13,9 +13,10 @@ from dotenv import load_dotenv
 # ==================== PEMILIHAN MODE / CONFIG ====================
 #
 # Cara pakai:
-#   python3 main.py               → pakai .env (default)
-#   python3 main.py profit        → preset mode profit (config_profit.env)
-#   python3 main.py wager         → preset mode wager  (config_wager.env)
+#   python3 main.py               → tampilkan menu pilihan mode
+#   python3 main.py profit        → mode profit (muncul sub-menu pin)
+#   python3 main.py profit --rows 14 → mode profit 14 pin langsung
+#   python3 main.py wager         → langsung mode wager
 #   python3 main.py --config file.env → file config kustom apapun
 #
 # Urutan prioritas (dari tertinggi ke terendah):
@@ -380,7 +381,8 @@ class State:
         # Dashboard
         self.events = []                    # buffer pesan event penting (maks 4 baris)
         self.dashboard_lines = 0            # jumlah baris dashboard yang sedang tampil
-        self._last_event_count = 0          # untuk non-TTY: track event yang sudah dicetak
+        self._event_log = []                # untuk non-TTY: semua event (append-only, tidak rolling)
+        self._last_event_count = 0          # indeks berikutnya yang belum dicetak di _event_log
 
     @property
     def net_profit(self):
@@ -749,13 +751,16 @@ def format_rupiah(amount):
 
 def add_event(msg: str):
     """
-    Simpan pesan event ke buffer rolling (maks 4 baris).
-    Event ditampilkan di bagian bawah dashboard, bukan di-print terpisah
-    agar terminal tidak scroll dan berantakan.
+    Simpan pesan event ke buffer rolling (maks 4 baris) untuk dashboard TTY.
+    Untuk non-TTY, simpan juga ke _event_log (append-only) agar tidak ada
+    yang terlewat — rolling buffer tidak bisa dipakai sebagai tracker posisi
+    karena panjangnya selalu ≤ 4.
     """
-    state.events.append(msg)          # tambah pesan baru ke list
+    state.events.append(msg)          # tambah pesan baru ke rolling list
     if len(state.events) > 4:         # jaga agar tidak lebih dari 4
         state.events.pop(0)           # buang yang paling lama
+    if not _TTY:
+        state._event_log.append(msg)  # simpan semua event tanpa batas untuk non-TTY
 
 def update_dashboard(result=None):
     """
@@ -788,11 +793,13 @@ def update_dashboard(result=None):
                 f"net={nsign}{format_rupiah(net)}",
                 flush=True
             )
-        # Cetak hanya event yang belum pernah dicetak (hindari duplikasi)
-        new_events = state.events[state._last_event_count:]
+        # Cetak hanya event yang belum pernah dicetak (gunakan _event_log,
+        # bukan state.events yang rolling — panjangnya selalu ≤ 4 sehingga
+        # _last_event_count akan mentok dan event baru tidak pernah tercetak)
+        new_events = state._event_log[state._last_event_count:]
         for ev in new_events:
             print(ev, flush=True)
-        state._last_event_count = len(state.events)
+        state._last_event_count = len(state._event_log)
         return
 
     # ── Hitung nilai statistik ──────────────────────────────────────
@@ -936,7 +943,10 @@ def take_profit_countdown(seconds):
     User bisa tekan Ctrl+C untuk membatalkan dan lanjut bet.
     """
     print(f"\n💰 TAKE PROFIT tercapai! Bot berhenti dalam {seconds} detik...")
-    print("   (Tekan Ctrl+C dalam countdown ini untuk LANJUT bet)\n")
+    if _TTY:
+        print("   (Tekan Ctrl+C dalam countdown ini untuk LANJUT bet)\n")
+    else:
+        print("   (Kirim SIGINT ke proses untuk membatalkan countdown)\n")
     try:
         for remaining in range(seconds, 0, -1):
             print(f"\r   ⏳ Berhenti dalam {remaining:2d} detik...", end='', flush=True)
@@ -1043,8 +1053,7 @@ def check_stop_conditions():
         return True
 
     # ── Stop loss absolut ────────────────────────────────────────────
-    # balance >= 0 agar saldo persis 0 juga tertangkap
-    if CONFIG['STOP_LOSS'] > 0 and state.balance >= 0 and state.balance <= CONFIG['STOP_LOSS']:
+    if CONFIG['STOP_LOSS'] > 0 and state.balance <= CONFIG['STOP_LOSS']:
         clear_dashboard()
         print(f"\n🛑 STOP LOSS tercapai!")
         print(f"   Saldo    : {format_rupiah(state.balance)}")
