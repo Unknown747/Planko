@@ -587,6 +587,11 @@ query GetBalance {
 }
 """
 
+# ==================== HTTP SESSION ====================
+# Satu Session di-reuse sepanjang sesi bot — menghindari TCP/TLS handshake
+# baru di setiap request (hemat 100–300ms per bet).
+_session = requests.Session()
+
 # ==================== FUNGSI UTAMA ====================
 
 def get_headers():
@@ -624,7 +629,7 @@ def get_balance(silent=False):
         return None
 
     try:
-        response = requests.post(
+        response = _session.post(
             CONFIG['GRAPHQL_URL'],
             json={'query': BALANCE_QUERY},
             headers=get_headers(),
@@ -688,7 +693,7 @@ def place_plinko_bet():
 
     while True:
         try:
-            response = requests.post(
+            response = _session.post(
                 CONFIG['GRAPHQL_URL'],
                 json={
                     'query': PLINKO_BET_MUTATION,
@@ -1152,7 +1157,7 @@ def main():
         while state.is_running:
 
             # ── Refresh balance & cek stop setiap 5 bet ──────────────
-            if iteration > 0 and iteration % 5 == 0:
+            if iteration > 0 and iteration % 10 == 0:
                 fetched = get_balance(silent=True)   # error masuk event log, bukan print
                 if fetched is None:
                     add_event("⚠️  Balance gagal diambil, pakai nilai terakhir")
