@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # main.py - Auto Bet Plinko Stake.com
 import requests
+import random   # untuk bet acak & delay acak
 import time
 import os
 import sys
@@ -48,13 +49,48 @@ def _parse_env():
     if bet_amount <= 0:
         errors.append(f"BET_AMOUNT={bet_amount} harus lebih dari 0.")
 
+    # Bet acak: jika BET_AMOUNT_MIN & BET_AMOUNT_MAX diisi, base bet dirandom tiap reset
+    # Jika tidak diisi (0), pakai BET_AMOUNT tetap seperti biasa
+    bet_amount_min = get_float('BET_AMOUNT_MIN', 0)
+    bet_amount_max = get_float('BET_AMOUNT_MAX', 0)
+    if bet_amount_min > 0 or bet_amount_max > 0:
+        if bet_amount_min <= 0:
+            errors.append("BET_AMOUNT_MIN harus > 0 jika BET_AMOUNT_MAX diisi.")
+        if bet_amount_max <= 0:
+            errors.append("BET_AMOUNT_MAX harus > 0 jika BET_AMOUNT_MIN diisi.")
+        if bet_amount_min > 0 and bet_amount_max > 0 and bet_amount_min >= bet_amount_max:
+            errors.append(f"BET_AMOUNT_MIN ({bet_amount_min}) harus lebih kecil dari BET_AMOUNT_MAX ({bet_amount_max}).")
+
+    # Delay acak: jika BASE_DELAY_MIN_MS & BASE_DELAY_MAX_MS diisi, delay dirandom per bet
+    # Jika tidak diisi (0), pakai BASE_DELAY_MS tetap
     base_delay = get_int('BASE_DELAY_MS', 200)
     if base_delay < 0:
         errors.append(f"BASE_DELAY_MS={base_delay} tidak boleh negatif.")
+    delay_min = get_int('BASE_DELAY_MIN_MS', 0)
+    delay_max = get_int('BASE_DELAY_MAX_MS', 0)
+    if delay_min > 0 or delay_max > 0:
+        if delay_min <= 0:
+            errors.append("BASE_DELAY_MIN_MS harus > 0 jika BASE_DELAY_MAX_MS diisi.")
+        if delay_max <= 0:
+            errors.append("BASE_DELAY_MAX_MS harus > 0 jika BASE_DELAY_MIN_MS diisi.")
+        if delay_min > 0 and delay_max > 0 and delay_min >= delay_max:
+            errors.append(f"BASE_DELAY_MIN_MS ({delay_min}) harus lebih kecil dari BASE_DELAY_MAX_MS ({delay_max}).")
 
     stop_loss = get_float('STOP_LOSS', 10000)
     if stop_loss < 0:
         errors.append(f"STOP_LOSS={stop_loss} tidak boleh negatif.")
+
+    # Stop loss relatif: berhenti jika rugi >= MAX_LOSS dari modal awal sesi
+    # Berbeda dari STOP_LOSS (saldo absolut) — ini berbasis selisih dari awal
+    max_loss = get_float('MAX_LOSS', 0)
+    if max_loss < 0:
+        errors.append(f"MAX_LOSS={max_loss} tidak boleh negatif.")
+
+    # Jackpot stop: berhenti LANGSUNG (tanpa countdown) jika multiplier >= nilai ini
+    # Contoh: JACKPOT_STOP_MULTIPLIER=420 → kunci profit saat kena x420 atau lebih
+    jackpot_stop = get_float('JACKPOT_STOP_MULTIPLIER', 0)   # 0 = nonaktif
+    if jackpot_stop < 0:
+        errors.append(f"JACKPOT_STOP_MULTIPLIER={jackpot_stop} tidak boleh negatif.")
 
     wager_target = get_float('WAGER_TARGET', 0)
     if wager_target < 0:
@@ -128,13 +164,19 @@ def _parse_env():
     return {
         'STAKE_API_TOKEN': os.getenv('STAKE_API_TOKEN', ''),
         'RISK': risk,
-        'RISK_ENUM': risk_enum,           # 'low'/'medium'/'high' untuk GraphQL
+        'RISK_ENUM': risk_enum,               # 'low'/'medium'/'high' untuk GraphQL
         'ROWS': rows,
-        'BET_AMOUNT': bet_amount,         # bet dasar (selalu jadi acuan reset)
-        'CURRENCY': currency_raw.upper(), # tampilan: IDR
-        'CURRENCY_ENUM': currency_enum,   # untuk GraphQL: idr
-        'BASE_DELAY_MS': base_delay,
-        'STOP_LOSS': stop_loss,
+        'BET_AMOUNT': bet_amount,             # bet dasar tetap (dipakai jika MIN/MAX tidak diisi)
+        'BET_AMOUNT_MIN': bet_amount_min,     # batas bawah bet acak (0 = nonaktif)
+        'BET_AMOUNT_MAX': bet_amount_max,     # batas atas bet acak (0 = nonaktif)
+        'CURRENCY': currency_raw.upper(),
+        'CURRENCY_ENUM': currency_enum,
+        'BASE_DELAY_MS': base_delay,          # delay tetap (dipakai jika MIN/MAX tidak diisi)
+        'BASE_DELAY_MIN_MS': delay_min,       # batas bawah delay acak (0 = nonaktif)
+        'BASE_DELAY_MAX_MS': delay_max,       # batas atas delay acak
+        'STOP_LOSS': stop_loss,               # saldo absolut minimum sebelum berhenti
+        'MAX_LOSS': max_loss,                 # rugi relatif maks dari modal awal sesi (0 = nonaktif)
+        'JACKPOT_STOP_MULTIPLIER': jackpot_stop,  # multiplier ambang jackpot-stop (0 = nonaktif)
         'WAGER_TARGET': wager_target,
         'TAKE_PROFIT': take_profit,
         'TAKE_PROFIT_DELAY_SEC': take_profit_delay,
@@ -156,6 +198,24 @@ except ValueError as _cfg_err:
     print(_cfg_err)
     sys.exit(1)
 
+# ==================== HELPER BET ACAK ====================
+
+def get_base_bet() -> float:
+    """
+    Kembalikan nominal bet dasar untuk satu siklus.
+
+    Jika BET_AMOUNT_MIN dan BET_AMOUNT_MAX diisi → pilih secara acak di antara keduanya.
+    Ini membuat pola bet lebih tidak terduga (anti-deteksi pola oleh server).
+    Jika tidak diisi → pakai BET_AMOUNT tetap seperti biasa.
+    """
+    if CONFIG['BET_AMOUNT_MIN'] > 0 and CONFIG['BET_AMOUNT_MAX'] > 0:
+        # random.uniform → float acak termasuk batas bawah dan atas
+        raw = random.uniform(CONFIG['BET_AMOUNT_MIN'], CONFIG['BET_AMOUNT_MAX'])
+        # Bulatkan ke kelipatan 50 terdekat agar nominal rapi (50, 100, 150, dst.)
+        step = 50
+        return max(CONFIG['BET_AMOUNT_MIN'], round(raw / step) * step)
+    return CONFIG['BET_AMOUNT']
+
 # ==================== STATE ====================
 class State:
     def __init__(self):
@@ -169,7 +229,7 @@ class State:
         self.start_time = datetime.now()
         self.bet_results = []               # rolling max 200 entri (kompatibilitas)
         # Strategi
-        self.current_bet = CONFIG['BET_AMOUNT']  # bet aktif saat ini
+        self.current_bet = get_base_bet()   # bet pertama: acak jika MIN/MAX diisi
         self.win_streak = 0                       # berapa kali menang berturut-turut
         self.loss_streak = 0                      # berapa kali kalah berturut-turut (Martingale)
         self.martingale_capped = False            # True jika bet terakhir sudah kena MAX_BET cap
@@ -284,7 +344,8 @@ def calculate_next_bet(last_profit: float) -> float:
       - MAX_BET : batas atas nominal; jika terlampaui, reset setelah bet ini.
     """
     if CONFIG['STRATEGY'] == 'FLAT':
-        return CONFIG['BET_AMOUNT']
+        # FLAT: tiap bet pakai base bet (acak jika MIN/MAX diisi)
+        return get_base_bet()
 
     won = last_profit > 0
 
@@ -292,12 +353,14 @@ def calculate_next_bet(last_profit: float) -> float:
         if won:
             state.win_streak += 1
             if state.win_streak >= CONFIG['WIN_STREAK_CAP']:
+                # Streak menang mentok cap → reset ke base baru (acak)
                 state.win_streak = 0
-                return CONFIG['BET_AMOUNT']
+                return get_base_bet()
             next_bet = state.current_bet * CONFIG['BET_MULTIPLIER']
         else:
+            # Kalah → reset ke base baru (acak)
             state.win_streak = 0
-            return CONFIG['BET_AMOUNT']
+            return get_base_bet()
 
         if CONFIG['MAX_BET'] > 0 and next_bet > CONFIG['MAX_BET']:
             next_bet = CONFIG['MAX_BET']
@@ -306,29 +369,29 @@ def calculate_next_bet(last_profit: float) -> float:
 
     # MARTINGALE
     if won:
-        # Menang → reset ke dasar, bersihkan semua flag
+        # Menang → reset ke base baru (acak), bersihkan semua flag
         state.loss_streak = 0
         state.martingale_capped = False
-        return CONFIG['BET_AMOUNT']
+        return get_base_bet()
 
     # Kalah ↓
-    # Jika bet sebelumnya sudah di cap → satu siklus cukup, reset ke dasar (tidak kejar terus)
+    # Jika bet sebelumnya sudah di cap → satu siklus cukup, reset ke base baru (acak)
     if state.martingale_capped:
         state.loss_streak = 0
         state.martingale_capped = False
-        return CONFIG['BET_AMOUNT']
+        return get_base_bet()
 
     state.loss_streak += 1
 
-    # Cut-loss: streak kalah sudah mentok LOSS_STREAK_CAP
+    # Cut-loss: streak kalah sudah mentok LOSS_STREAK_CAP → reset ke base baru (acak)
     if CONFIG['LOSS_STREAK_CAP'] > 0 and state.loss_streak >= CONFIG['LOSS_STREAK_CAP']:
         state.loss_streak = 0
         state.martingale_capped = False
-        return CONFIG['BET_AMOUNT']
+        return get_base_bet()
 
     next_bet = state.current_bet * CONFIG['BET_MULTIPLIER']
 
-    # Jika melampaui MAX_BET → bet di cap, dan tandai agar bet berikutnya reset ke dasar
+    # Jika melampaui MAX_BET → bet di cap, tandai agar bet berikutnya reset ke base
     if CONFIG['MAX_BET'] > 0 and next_bet > CONFIG['MAX_BET']:
         state.martingale_capped = True
         return CONFIG['MAX_BET']
@@ -579,12 +642,25 @@ def update_dashboard(result=None):
     wager_bar = ''
     if CONFIG['WAGER_TARGET'] > 0:
         pct    = min(state.total_wagered / CONFIG['WAGER_TARGET'], 1.0)
-        bar_w  = 14                              # lebar bar dalam karakter
-        filled = int(pct * bar_w)               # berapa karakter terisi
+        bar_w  = 14
+        filled = int(pct * bar_w)
         wager_bar = (
-            f"  {_c('█' * filled, _CYN)}"       # bagian terisi → cyan
-            f"{'░' * (bar_w - filled)}"          # bagian kosong
+            f"  {_c('█' * filled, _CYN)}"
+            f"{'░' * (bar_w - filled)}"
             f"  {pct*100:.0f}%"
+        )
+
+    # Progress bar MAX_LOSS — bar merah menunjukkan seberapa dekat ke batas rugi
+    loss_bar = ''
+    if CONFIG['MAX_LOSS'] > 0:
+        cur_loss  = max(0, -state.net_profit)    # kerugian saat ini (0 jika masih untung)
+        pct_loss  = min(cur_loss / CONFIG['MAX_LOSS'], 1.0)
+        bar_w     = 14
+        filled    = int(pct_loss * bar_w)
+        loss_bar  = (
+            f"  {_c('█' * filled, _RED)}"        # bagian terpakai → merah
+            f"{'░' * (bar_w - filled)}"
+            f"  {pct_loss*100:.0f}%"
         )
 
     # Info hasil bet terakhir
@@ -594,7 +670,8 @@ def update_dashboard(result=None):
         m   = result.get('multiplier', 0)
         p_s = f"{'+'if p>0 else ''}{format_rupiah(p)}"
 
-        if m >= 420:
+        jackpot_thr = CONFIG['JACKPOT_STOP_MULTIPLIER'] if CONFIG['JACKPOT_STOP_MULTIPLIER'] > 0 else 420
+        if m >= jackpot_thr:
             # Jackpot — muncul tebal kuning + masuk event log
             last_str = _c(f"🚨 JACKPOT! x{m:.0f}  {p_s}", _BOLD, _YLW)
             add_event(_c(f"🚨 JACKPOT x{m:.0f} hit! Profit: {p_s}", _BOLD, _YLW))
@@ -635,6 +712,8 @@ def update_dashboard(result=None):
     rows.append(f"  💳 Balance   : {_c(format_rupiah(state.balance), _BOLD)}")
     rows.append(f"  📈 Net P/L   : {net_str}")
     rows.append(f"  🎯 Wager     : {format_rupiah(state.total_wagered)}{wager_bar}")
+    if CONFIG['MAX_LOSS'] > 0:
+        rows.append(f"  🛡️  Max Loss  : {format_rupiah(CONFIG['MAX_LOSS'])}{loss_bar}")
     rows.append(f"  🎲 Total Bet : {state.total_bets}")
     rows.append(DIV)
     rows.append(f"  ⚡ Last      : {last_str}")
@@ -708,13 +787,29 @@ def print_header():
     print("="*55)
     print(f"⚙️  Risk      : {CONFIG['RISK']}")
     print(f"📊 Rows      : {CONFIG['ROWS']}")
-    print(f"💰 Bet Dasar : {format_rupiah(CONFIG['BET_AMOUNT'])}")
-    print(f"🛑 Stop Loss : {format_rupiah(CONFIG['STOP_LOSS'])}")
+    # Tampilkan info bet dasar (tetap atau acak)
+    if CONFIG['BET_AMOUNT_MIN'] > 0 and CONFIG['BET_AMOUNT_MAX'] > 0:
+        print(f"💰 Bet Dasar : Rp {CONFIG['BET_AMOUNT_MIN']:.0f} – Rp {CONFIG['BET_AMOUNT_MAX']:.0f} (acak per siklus)")
+    else:
+        print(f"💰 Bet Dasar : {format_rupiah(CONFIG['BET_AMOUNT'])}")
+
+    # Tampilkan info delay (tetap atau acak)
+    if CONFIG['BASE_DELAY_MIN_MS'] > 0 and CONFIG['BASE_DELAY_MAX_MS'] > 0:
+        print(f"⏱️  Delay     : {CONFIG['BASE_DELAY_MIN_MS']}–{CONFIG['BASE_DELAY_MAX_MS']}ms (acak)")
+    else:
+        print(f"⏱️  Delay     : {CONFIG['BASE_DELAY_MS']}ms")
+
+    # Stop conditions
+    if CONFIG['STOP_LOSS'] > 0:
+        print(f"🛑 Stop Loss : {format_rupiah(CONFIG['STOP_LOSS'])} (saldo absolut)")
+    if CONFIG['MAX_LOSS'] > 0:
+        print(f"🛡️  Max Loss  : -{format_rupiah(CONFIG['MAX_LOSS'])} dari modal awal (relatif)")
     if CONFIG['TAKE_PROFIT'] > 0:
         print(f"✅ Take Profit: +{format_rupiah(CONFIG['TAKE_PROFIT'])} profit (delay {CONFIG['TAKE_PROFIT_DELAY_SEC']}s)")
+    if CONFIG['JACKPOT_STOP_MULTIPLIER'] > 0:
+        print(f"🚨 Jackpot Stop: langsung berhenti jika kena x{CONFIG['JACKPOT_STOP_MULTIPLIER']:.0f}+")
     if CONFIG['WAGER_TARGET'] > 0:
         print(f"🎯 Wager Target: {format_rupiah(CONFIG['WAGER_TARGET'])}")
-    print(f"⏱️  Delay     : {CONFIG['BASE_DELAY_MS']}ms")
     # Info strategi
     if CONFIG['STRATEGY'] == 'FLAT':
         print(f"📐 Strategi  : FLAT (bet selalu tetap)")
@@ -774,13 +869,23 @@ def check_stop_conditions():
         print(f"   Total wagered: {format_rupiah(state.total_wagered)}")
         return True
 
-    # ── Stop loss ────────────────────────────────────────────────────
+    # ── Stop loss absolut ────────────────────────────────────────────
     # balance >= 0 agar saldo persis 0 juga tertangkap
     if CONFIG['STOP_LOSS'] > 0 and state.balance >= 0 and state.balance <= CONFIG['STOP_LOSS']:
         clear_dashboard()
         print(f"\n🛑 STOP LOSS tercapai!")
         print(f"   Saldo    : {format_rupiah(state.balance)}")
         print(f"   Threshold: {format_rupiah(CONFIG['STOP_LOSS'])}")
+        return True
+
+    # ── Max loss relatif ─────────────────────────────────────────────
+    # Berhenti jika rugi >= MAX_LOSS dari modal awal sesi (independen dari saldo absolut)
+    if CONFIG['MAX_LOSS'] > 0 and state.balance_initialized and (-state.net_profit) >= CONFIG['MAX_LOSS']:
+        clear_dashboard()
+        print(f"\n🛡️  MAX LOSS tercapai! Melindungi modal.")
+        print(f"   Rugi sesi ini : {format_rupiah(-state.net_profit)}")
+        print(f"   Batas rugi    : {format_rupiah(CONFIG['MAX_LOSS'])}")
+        print(f"   Saldo sekarang: {format_rupiah(state.balance)}")
         return True
 
     return False
@@ -904,13 +1009,32 @@ def main():
             if state.total_bets % 100 == 0:
                 trim_log_if_needed()
 
-            # ── Cek kondisi berhenti ──────────────────────────────────
+            # ── Jackpot stop — cek SEBELUM stop conditions biasa ─────
+            # Jika multiplier >= JACKPOT_STOP_MULTIPLIER → kunci profit, berhenti LANGSUNG
+            # tanpa countdown (tidak bisa dibatalkan). Ini melindungi kemenangan besar.
+            m = result.get('multiplier', 0)
+            jstop = CONFIG['JACKPOT_STOP_MULTIPLIER']
+            if jstop > 0 and m >= jstop:
+                clear_dashboard()
+                print(f"\n🚨 JACKPOT x{m:.0f} TERKENA! Profit dikunci, bot berhenti.")
+                print(f"   Profit sesi  : +{format_rupiah(state.net_profit)}")
+                print(f"   Saldo sekarang: {format_rupiah(state.balance)}")
+                state.is_running = False
+                break
+
+            # ── Cek kondisi berhenti biasa ────────────────────────────
             if check_stop_conditions():
                 state.is_running = False
                 break
 
-            # ── Delay sebelum bet berikutnya ──────────────────────────
-            time.sleep(CONFIG['BASE_DELAY_MS'] / 1000.0)
+            # ── Delay acak sebelum bet berikutnya ─────────────────────
+            # Jika BASE_DELAY_MIN_MS & BASE_DELAY_MAX_MS diisi → delay random di antara keduanya
+            # (mencegah pola interval tetap yang mudah dideteksi server)
+            if CONFIG['BASE_DELAY_MIN_MS'] > 0 and CONFIG['BASE_DELAY_MAX_MS'] > 0:
+                delay_ms = random.randint(CONFIG['BASE_DELAY_MIN_MS'], CONFIG['BASE_DELAY_MAX_MS'])
+            else:
+                delay_ms = CONFIG['BASE_DELAY_MS']
+            time.sleep(delay_ms / 1000.0)
             iteration += 1
 
     except KeyboardInterrupt:
