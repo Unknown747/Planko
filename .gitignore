@@ -21,3 +21,8 @@ build/
 venv/
 .venv/
 env/
+
+# Replit-specific — jangan di-commit ke repo VPS
+.pythonlibs/
+.replit
+replit.nix

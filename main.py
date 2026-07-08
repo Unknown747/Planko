@@ -19,6 +19,11 @@ import argparse
 from datetime import datetime
 from dotenv import load_dotenv
 
+# Direktori tempat main.py berada — dipakai untuk resolve semua file config.
+# Ini memastikan script bisa dijalankan dari direktori mana saja, misalnya:
+#   cd ~  &&  python3 /opt/plinko/main.py profit --rows 14
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # ==================== PEMILIHAN MODE / CONFIG ====================
 #
 # Cara pakai:
@@ -72,7 +77,7 @@ def _tampilkan_menu():
     print("  ║       Expert mode, 1 bola per gilir  ║")
     print("  ║                                      ║")
     print("  ║   2.  🎯 WAGER                       ║")
-    print("  ║       Bet Rp 500, max 2x recovery    ║")
+    print("  ║       Bet Rp 500 flat, LOW risk       ║")
     print("  ║       Farming bonus, se-safe mungkin ║")
     print("  ║                                      ║")
     print("  ╚══════════════════════════════════════╝")
@@ -126,7 +131,7 @@ _mode = None
 _rows_override = None
 
 if _args.config:
-    # File config kustom langsung — lewati semua menu
+    # File config kustom — path relatif terhadap CWD (sesuai yang diketik user)
     _config_file = _args.config
     if not os.path.exists(_config_file):
         print(f"❌ File config tidak ditemukan: {_config_file}")
@@ -134,7 +139,9 @@ if _args.config:
 else:
     # Mode dari argumen CLI atau menu interaktif
     _mode = _args.mode if _args.mode else _tampilkan_menu()
-    _config_file = f'config_{_mode}.env'
+    # Path relatif terhadap direktori script — bukan CWD — agar bisa dijalankan
+    # dari direktori mana saja: python3 /opt/plinko/main.py profit --rows 14
+    _config_file = os.path.join(_SCRIPT_DIR, f'config_{_mode}.env')
     if not os.path.exists(_config_file):
         print(f"❌ File preset tidak ditemukan: {_config_file}")
         sys.exit(1)
@@ -156,14 +163,15 @@ else:
 # Ini perlu karena load_dotenv(override=True) akan menimpa shell vars jika tidak dijaga.
 _shell_env = dict(os.environ)                   # simpan env shell / Replit Secrets
 load_dotenv(dotenv_path=_config_file, override=True)  # preset: set semua nilai dasar
-load_dotenv(override=True)                      # .env menimpa preset
+# .env dicari di direktori script (bukan CWD) agar konsisten lintas working-dir
+load_dotenv(dotenv_path=os.path.join(_SCRIPT_DIR, '.env'), override=True)
 os.environ.update(_shell_env)                   # shell/Secrets kembali jadi yang utama
 
 # Terapkan override pin setelah load_dotenv agar mengalahkan nilai preset
 if _rows_override is not None:
     os.environ['ROWS'] = str(_rows_override)
 
-_mode_label = _config_file.replace('config_', '').replace('.env', '').upper()
+_mode_label = os.path.basename(_config_file).replace('config_', '').replace('.env', '').upper()
 _pin_label   = f" ({_rows_override} PIN)" if _rows_override else ""
 print(f"  📂 Mode   : {_mode_label}{_pin_label}")
 
