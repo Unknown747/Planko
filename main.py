@@ -69,13 +69,14 @@ def _parse_env():
         errors.append(f"TAKE_PROFIT_DELAY_SEC={take_profit_delay} tidak boleh negatif.")
 
     # --- Strategi betting ---
-    valid_strategies = {'FLAT', 'ANTI_MARTINGALE'}
+    valid_strategies = {'FLAT', 'ANTI_MARTINGALE', 'MARTINGALE'}
     strategy = os.getenv('STRATEGY', 'FLAT').upper()
     if strategy not in valid_strategies:
-        errors.append(f"STRATEGY='{strategy}' tidak valid. Pilihan: FLAT, ANTI_MARTINGALE.")
+        errors.append(f"STRATEGY='{strategy}' tidak valid. Pilihan: FLAT, ANTI_MARTINGALE, MARTINGALE.")
 
     bet_multiplier = get_float('BET_MULTIPLIER', 2.0)
     win_streak_cap = get_int('WIN_STREAK_CAP', 3)
+    loss_streak_cap = get_int('LOSS_STREAK_CAP', 0)  # 0 = tidak ada batas (pure Martingale)
     max_bet = get_float('MAX_BET', 0)  # 0 = tidak ada batas
 
     # Validasi parameter Anti-Martingale hanya jika strategi benar-benar memakainya
@@ -86,6 +87,15 @@ def _parse_env():
             errors.append(f"WIN_STREAK_CAP={win_streak_cap} harus minimal 1.")
         if max_bet < 0:
             errors.append(f"MAX_BET={max_bet} tidak boleh negatif.")
+
+    # Validasi parameter Martingale
+    if strategy == 'MARTINGALE':
+        if bet_multiplier <= 1.0:
+            errors.append(f"BET_MULTIPLIER={bet_multiplier} harus lebih dari 1 (contoh: 2).")
+        if max_bet < 0:
+            errors.append(f"MAX_BET={max_bet} tidak boleh negatif.")
+        if loss_streak_cap < 0:
+            errors.append(f"LOSS_STREAK_CAP={loss_streak_cap} tidak boleh negatif.")
 
     max_errors = get_int('MAX_CONSECUTIVE_ERRORS', 5)
     if max_errors < 1:
@@ -131,6 +141,7 @@ def _parse_env():
         'STRATEGY': strategy,
         'BET_MULTIPLIER': bet_multiplier,
         'WIN_STREAK_CAP': win_streak_cap,
+        'LOSS_STREAK_CAP': loss_streak_cap,
         'MAX_BET': max_bet,
         'MAX_CONSECUTIVE_ERRORS': max_errors,
         'MAX_RATE_LIMIT_RETRIES': max_retries,
@@ -160,6 +171,12 @@ class State:
         # Strategi
         self.current_bet = CONFIG['BET_AMOUNT']  # bet aktif saat ini
         self.win_streak = 0                       # berapa kali menang berturut-turut
+        self.loss_streak = 0                      # berapa kali kalah berturut-turut (Martingale)
+        self.martingale_capped = False            # True jika bet terakhir sudah kena MAX_BET cap
+        self.win_count = 0                        # total bet yang menang (untuk win rate final)
+        # Dashboard
+        self.events = []                          # buffer pesan event penting (maks 4 baris)
+        self.dashboard_lines = 0                  # jumlah baris dashboard yang sedang tampil
 
     @property
     def net_profit(self):
@@ -167,6 +184,21 @@ class State:
         return self.balance - self.initial_balance
 
 state = State()
+
+# ==================== ANSI COLORS ====================
+# Kode warna terminal — otomatis dinonaktifkan jika output bukan TTY
+_TTY  = sys.stdout.isatty()          # True jika output ke terminal langsung
+_RST  = '\033[0m'   if _TTY else ''  # Reset warna
+_BOLD = '\033[1m'   if _TTY else ''  # Tebal
+_DIM  = '\033[2m'   if _TTY else ''  # Redup
+_GRN  = '\033[92m'  if _TTY else ''  # Hijau terang  → profit / menang
+_RED  = '\033[91m'  if _TTY else ''  # Merah terang  → rugi / kalah
+_YLW  = '\033[93m'  if _TTY else ''  # Kuning terang → big win
+_CYN  = '\033[96m'  if _TTY else ''  # Cyan          → info waktu
+
+def _c(text, *codes):
+    """Bungkus teks dengan satu atau lebih kode ANSI lalu reset."""
+    return ''.join(codes) + str(text) + _RST
 
 # ==================== LOG FILE ====================
 
@@ -232,32 +264,66 @@ def calculate_next_bet(last_profit: float) -> float:
     """
     Hitung nominal bet berikutnya berdasarkan hasil bet terakhir.
 
-    FLAT        : selalu BET_AMOUNT.
+    FLAT          : selalu BET_AMOUNT.
     ANTI_MARTINGALE:
       - Menang  → lipat current_bet × BET_MULTIPLIER, maks WIN_STREAK_CAP kali lipat
                   dan tidak melampaui MAX_BET (jika diset).
       - Kalah   → reset ke BET_AMOUNT dasar.
+    MARTINGALE:
+      - Kalah   → lipat current_bet × BET_MULTIPLIER (kejar kerugian).
+      - Menang  → reset ke BET_AMOUNT dasar.
+      - LOSS_STREAK_CAP: jika setreak kalah mencapai cap, reset ke dasar (cut loss).
+      - MAX_BET : batas atas nominal; jika terlampaui, reset setelah bet ini.
     """
     if CONFIG['STRATEGY'] == 'FLAT':
         return CONFIG['BET_AMOUNT']
 
-    # ANTI_MARTINGALE
     won = last_profit > 0
-    if won:
-        state.win_streak += 1
-        if state.win_streak >= CONFIG['WIN_STREAK_CAP']:
-            # Sudah mentok cap → reset (ambil profit, mulai lagi dari bawah)
+
+    if CONFIG['STRATEGY'] == 'ANTI_MARTINGALE':
+        if won:
+            state.win_streak += 1
+            if state.win_streak >= CONFIG['WIN_STREAK_CAP']:
+                state.win_streak = 0
+                return CONFIG['BET_AMOUNT']
+            next_bet = state.current_bet * CONFIG['BET_MULTIPLIER']
+        else:
             state.win_streak = 0
             return CONFIG['BET_AMOUNT']
-        next_bet = state.current_bet * CONFIG['BET_MULTIPLIER']
-    else:
-        state.win_streak = 0
+
+        if CONFIG['MAX_BET'] > 0 and next_bet > CONFIG['MAX_BET']:
+            next_bet = CONFIG['MAX_BET']
+            state.win_streak = 0
+        return next_bet
+
+    # MARTINGALE
+    if won:
+        # Menang → reset ke dasar, bersihkan semua flag
+        state.loss_streak = 0
+        state.martingale_capped = False
         return CONFIG['BET_AMOUNT']
 
-    # Terapkan MAX_BET jika diset
+    # Kalah ↓
+    # Jika bet sebelumnya sudah di cap → satu siklus cukup, reset ke dasar (tidak kejar terus)
+    if state.martingale_capped:
+        state.loss_streak = 0
+        state.martingale_capped = False
+        return CONFIG['BET_AMOUNT']
+
+    state.loss_streak += 1
+
+    # Cut-loss: streak kalah sudah mentok LOSS_STREAK_CAP
+    if CONFIG['LOSS_STREAK_CAP'] > 0 and state.loss_streak >= CONFIG['LOSS_STREAK_CAP']:
+        state.loss_streak = 0
+        state.martingale_capped = False
+        return CONFIG['BET_AMOUNT']
+
+    next_bet = state.current_bet * CONFIG['BET_MULTIPLIER']
+
+    # Jika melampaui MAX_BET → bet di cap, dan tandai agar bet berikutnya reset ke dasar
     if CONFIG['MAX_BET'] > 0 and next_bet > CONFIG['MAX_BET']:
-        next_bet = CONFIG['MAX_BET']
-        state.win_streak = 0  # anggap sudah cap, reset setelah bet ini
+        state.martingale_capped = True
+        return CONFIG['MAX_BET']
 
     return next_bet
 
@@ -452,43 +518,145 @@ def format_rupiah(amount):
     """Format angka ke Rupiah"""
     return f"Rp {amount:,.0f}".replace(',', '.')
 
-def update_status(result=None):
-    """Update status di konsol (baris yang sama)"""
-    elapsed = datetime.now() - state.start_time
-    elapsed_sec = elapsed.total_seconds()
-    minutes = int(elapsed_sec // 60)
-    seconds = int(elapsed_sec % 60)
+def add_event(msg: str):
+    """
+    Simpan pesan event ke buffer rolling (maks 4 baris).
+    Event ditampilkan di bagian bawah dashboard, bukan di-print terpisah
+    agar terminal tidak scroll dan berantakan.
+    """
+    state.events.append(msg)          # tambah pesan baru ke list
+    if len(state.events) > 4:         # jaga agar tidak lebih dari 4
+        state.events.pop(0)           # buang yang paling lama
 
-    # Bets per menit — hindari pembagian nol di detik-detik pertama
-    bpm = (state.total_bets / elapsed_sec * 60) if elapsed_sec >= 5 else 0
+def update_dashboard(result=None):
+    """
+    Render ulang blok statistik di posisi yang sama menggunakan ANSI
+    cursor-up. Terminal tidak pernah scroll selama bot berjalan.
 
-    balance_str = format_rupiah(state.balance)
-    wagered_str = format_rupiah(state.total_wagered)
+    Teknik:
+      1. Geser kursor ke atas sejumlah baris dashboard sebelumnya.
+      2. Tulis ulang setiap baris (hapus dulu dengan \\033[2K).
+    Hasilnya: dashboard selalu tampil di tempat yang sama, tidak bertambah.
+    """
+    # ── Hitung nilai statistik ──────────────────────────────────────
+    elapsed_sec = (datetime.now() - state.start_time).total_seconds()
+    mins = int(elapsed_sec // 60)
+    secs = int(elapsed_sec % 60)
+    bpm  = (state.total_bets / elapsed_sec * 60) if elapsed_sec >= 5 else 0
 
-    status = (
-        f"🎯 Bets: {state.total_bets} ({bpm:.0f}/min) | "
-        f"Wager: {wagered_str} | "
-        f"Balance: {balance_str} | "
-        f"Time: {minutes}m{seconds}s"
-    )
+    # Profit/rugi bersih dengan warna merah/hijau
+    net      = state.net_profit
+    net_sign = '+' if net >= 0 else ''
+    net_col  = _GRN if net >= 0 else _RED
+    net_str  = _c(f"{net_sign}{format_rupiah(abs(net))}", net_col, _BOLD)
 
+    # Progress bar wager (hanya jika WAGER_TARGET diset)
+    wager_bar = ''
+    if CONFIG['WAGER_TARGET'] > 0:
+        pct    = min(state.total_wagered / CONFIG['WAGER_TARGET'], 1.0)
+        bar_w  = 14                              # lebar bar dalam karakter
+        filled = int(pct * bar_w)               # berapa karakter terisi
+        wager_bar = (
+            f"  {_c('█' * filled, _CYN)}"       # bagian terisi → cyan
+            f"{'░' * (bar_w - filled)}"          # bagian kosong
+            f"  {pct*100:.0f}%"
+        )
+
+    # Info hasil bet terakhir
+    last_str = _c('—', _DIM)
     if result:
-        profit = result.get('profit', 0)
-        multiplier = result.get('multiplier', 0)
-        profit_str = f"+{format_rupiah(profit)}" if profit > 0 else format_rupiah(profit)
-        status += f" | Last: {profit_str} (x{multiplier:.2f})"
+        p   = result.get('profit', 0)
+        m   = result.get('multiplier', 0)
+        p_s = f"{'+'if p>0 else ''}{format_rupiah(p)}"
 
-    # Tampilkan info strategi Anti-Martingale
-    if CONFIG['STRATEGY'] == 'ANTI_MARTINGALE':
-        streak_bar = "🔥" * state.win_streak if state.win_streak > 0 else "·"
-        status += f" | Bet: {format_rupiah(state.current_bet)} {streak_bar}"
+        if m >= 420:
+            # Jackpot — muncul tebal kuning + masuk event log
+            last_str = _c(f"🚨 JACKPOT! x{m:.0f}  {p_s}", _BOLD, _YLW)
+            add_event(_c(f"🚨 JACKPOT x{m:.0f} hit! Profit: {p_s}", _BOLD, _YLW))
+        elif m >= 10:
+            # Big win — kuning terang + masuk event log
+            last_str = _c(f"🔥 BIG WIN! x{m:.2f}  {p_s}", _YLW)
+            add_event(_c(f"🔥 x{m:.2f} kena! {p_s}", _YLW))
+        elif p > 0:
+            last_str = _c(f"{p_s}  (x{m:.2f})", _GRN)
+        else:
+            last_str = _c(f"{p_s}  (x{m:.2f})", _RED)
 
-    print(f"\r{status}", end='', flush=True)
+    # Streak strategi (ikon + jumlah beruntun)
+    streak_str = ''
+    if CONFIG['STRATEGY'] == 'MARTINGALE' and state.loss_streak > 0:
+        streak_str = _c(
+            f"{'💀'*min(state.loss_streak,5)} {state.loss_streak}× kalah", _RED
+        )
+    elif CONFIG['STRATEGY'] == 'ANTI_MARTINGALE' and state.win_streak > 0:
+        streak_str = _c(
+            f"{'🔥'*min(state.win_streak,5)} {state.win_streak}× menang", _GRN
+        )
+
+    # ── Bangun baris-baris dashboard ───────────────────────────────
+    W   = 54                   # lebar pemisah
+    SEP = '═' * W              # garis tebal (atas/bawah)
+    DIV = '─' * W              # garis tipis (pemisah dalam)
+
+    rows = []
+    rows.append(SEP)
+    rows.append(
+        f"  {_c('🎰 PLINKO AUTO-BET', _BOLD)}"
+        f"{'':>12}"
+        f"{_c(f'{mins:02d}:{secs:02d}', _CYN, _BOLD)}"
+        f"  {_c(f'{bpm:.0f}/min', _DIM)}"
+    )
+    rows.append(DIV)
+    rows.append(f"  💳 Balance   : {_c(format_rupiah(state.balance), _BOLD)}")
+    rows.append(f"  📈 Net P/L   : {net_str}")
+    rows.append(f"  🎯 Wager     : {format_rupiah(state.total_wagered)}{wager_bar}")
+    rows.append(f"  🎲 Total Bet : {state.total_bets}")
+    rows.append(DIV)
+    rows.append(f"  ⚡ Last      : {last_str}")
+    rows.append(f"  💡 Next Bet  : {format_rupiah(state.current_bet)}  {streak_str}")
+    rows.append(DIV)
+
+    # Event log — selalu tampil 4 baris (kosong jika tidak ada event)
+    event_buf = (state.events + ['', '', '', ''])[:4]
+    for ev in event_buf:
+        rows.append(f"  {ev}" if ev else '')
+
+    rows.append(SEP)
+
+    # ── Render: geser kursor ke atas lalu timpa baris per baris ────
+    if state.dashboard_lines > 0:
+        # Naik ke baris pertama dashboard yang sudah dicetak
+        sys.stdout.write(f'\033[{state.dashboard_lines}A')
+
+    state.dashboard_lines = len(rows)   # catat untuk iterasi berikutnya
+
+    out = ''
+    for row in rows:
+        out += f'\r\033[2K{row}\n'      # \033[2K = hapus baris, lalu tulis ulang
+
+    sys.stdout.write(out)
+    sys.stdout.flush()
+
+def clear_dashboard():
+    """
+    Hapus blok dashboard dari terminal agar pesan stop/error kritis
+    bisa dicetak normal di bawahnya tanpa tumpang tindih.
+    """
+    if state.dashboard_lines > 0:
+        # Naik ke baris pertama, hapus setiap baris, kembali ke atas
+        sys.stdout.write(f'\033[{state.dashboard_lines}A')
+        for _ in range(state.dashboard_lines):
+            sys.stdout.write('\r\033[2K\n')
+        sys.stdout.write(f'\033[{state.dashboard_lines}A')
+        state.dashboard_lines = 0
+        sys.stdout.flush()
 
 def clear_line():
-    """Clear current console line"""
-    sys.stdout.write('\033[2K\r')
-    sys.stdout.flush()
+    """
+    Kompatibilitas mundur — gunakan clear_dashboard() di kode baru.
+    Menghapus satu baris (dipakai sebelum ada sistem dashboard).
+    """
+    clear_dashboard()    # sekarang membersihkan seluruh dashboard
 
 def take_profit_countdown(seconds):
     """
@@ -531,39 +699,57 @@ def print_header():
         print(f"   Pengali   : x{CONFIG['BET_MULTIPLIER']} saat menang")
         print(f"   Max lipat : {CONFIG['WIN_STREAK_CAP']}x berturut-turut lalu reset")
         print(f"   Max bet   : {max_bet_str}")
+    elif CONFIG['STRATEGY'] == 'MARTINGALE':
+        max_bet_str = format_rupiah(CONFIG['MAX_BET']) if CONFIG['MAX_BET'] > 0 else "tidak dibatas"
+        loss_cap_str = f"{CONFIG['LOSS_STREAK_CAP']}x kalah lalu cut-loss" if CONFIG['LOSS_STREAK_CAP'] > 0 else "tidak dibatas"
+        print(f"📐 Strategi  : MARTINGALE")
+        print(f"   Pengali   : x{CONFIG['BET_MULTIPLIER']} saat kalah")
+        print(f"   Cut-loss  : {loss_cap_str}")
+        print(f"   Max bet   : {max_bet_str}")
+        # Simulasi eskalasi bet
+        sim, steps = CONFIG['BET_AMOUNT'], []
+        for i in range(min(8, CONFIG['LOSS_STREAK_CAP'] if CONFIG['LOSS_STREAK_CAP'] > 0 else 8)):
+            steps.append(format_rupiah(sim))
+            sim *= CONFIG['BET_MULTIPLIER']
+            if CONFIG['MAX_BET'] > 0 and sim > CONFIG['MAX_BET']:
+                steps.append(f"{format_rupiah(CONFIG['MAX_BET'])} (cap)")
+                break
+        print(f"   Eskalasi  : {' → '.join(steps)}")
     print("="*55)
 
 def check_stop_conditions():
     """
     Cek semua kondisi stop: take profit, stop loss, wager target.
+    Sebelum print pesan, dashboard dibersihkan agar tidak tumpang tindih.
     Return True jika harus berhenti.
     """
-    # Take profit — cek lebih dahulu (kondisi positif)
+    # ── Take profit ─────────────────────────────────────────────────
     # Guard balance_initialized mencegah false positive sebelum saldo awal terisi
     if CONFIG['TAKE_PROFIT'] > 0 and state.balance_initialized and state.net_profit >= CONFIG['TAKE_PROFIT']:
-        clear_line()
-        net_str = format_rupiah(state.net_profit)
+        clear_dashboard()                        # bersihkan dashboard dulu
+        net_str    = format_rupiah(state.net_profit)
         target_str = format_rupiah(CONFIG['TAKE_PROFIT'])
         print(f"\n✅ TAKE PROFIT! Profit: +{net_str} (target: +{target_str})")
         print(f"   Saldo sekarang: {format_rupiah(state.balance)}")
         should_stop = take_profit_countdown(CONFIG['TAKE_PROFIT_DELAY_SEC'])
         if should_stop:
             return True
-        # Jika dibatalkan, geser target +TAKE_PROFIT agar tidak langsung trigger lagi
-        # (tetap di posisi profit saat ini sebagai baseline baru)
+        # Jika countdown dibatalkan (Ctrl+C), geser baseline target agar tidak langsung trigger lagi
         state.initial_balance = state.balance - CONFIG['TAKE_PROFIT'] + 1
+        state.dashboard_lines = 0               # paksa dashboard cetak ulang dari awal
         return False
 
-    # Wager target
+    # ── Wager target ─────────────────────────────────────────────────
     if CONFIG['WAGER_TARGET'] > 0 and state.total_wagered >= CONFIG['WAGER_TARGET']:
-        clear_line()
+        clear_dashboard()
         print(f"\n🎯 Wager target tercapai!")
         print(f"   Total wagered: {format_rupiah(state.total_wagered)}")
         return True
 
-    # Stop loss — balance >= 0 agar saldo 0 persis juga ikut tertangkap
+    # ── Stop loss ────────────────────────────────────────────────────
+    # balance >= 0 agar saldo persis 0 juga tertangkap
     if CONFIG['STOP_LOSS'] > 0 and state.balance >= 0 and state.balance <= CONFIG['STOP_LOSS']:
-        clear_line()
+        clear_dashboard()
         print(f"\n🛑 STOP LOSS tercapai!")
         print(f"   Saldo    : {format_rupiah(state.balance)}")
         print(f"   Threshold: {format_rupiah(CONFIG['STOP_LOSS'])}")
@@ -572,7 +758,8 @@ def check_stop_conditions():
     return False
 
 def print_final_stats():
-    """Print statistik akhir"""
+    """Print statistik akhir setelah dashboard dibersihkan."""
+    clear_dashboard()                            # hapus dashboard agar tidak tumpang tindih
     print("\n" + "="*55)
     print("📊  S T A T I S T I K   A K H I R")
     print("="*55)
@@ -586,11 +773,11 @@ def print_final_stats():
     print(f"💳 Final Balance : {format_rupiah(state.balance)}")
 
     if state.total_bets > 0:
-        win_count = sum(1 for r in state.bet_results if r.get('profit', 0) > 0)
-        win_rate = (win_count / state.total_bets) * 100
-        net_profit = sum(r.get('profit', 0) for r in state.bet_results)
+        # Gunakan state.win_count yang ditrack per-bet (tidak perlu iterasi list)
+        win_rate   = (state.win_count / state.total_bets) * 100
+        net_profit = state.net_profit
         profit_str = f"+{format_rupiah(net_profit)}" if net_profit >= 0 else format_rupiah(net_profit)
-        print(f"📈 Win Rate      : {win_rate:.1f}% ({win_count}/{state.total_bets})")
+        print(f"📈 Win Rate      : {win_rate:.1f}% ({state.win_count}/{state.total_bets})")
         print(f"💹 Net Profit    : {profit_str}")
 
     print("="*55)
@@ -632,62 +819,76 @@ def main():
     iteration = 0
     try:
         while state.is_running:
-            # Cek stop conditions setiap 5 bet (dan update balance)
+
+            # ── Refresh balance & cek stop setiap 5 bet ──────────────
             if iteration > 0 and iteration % 5 == 0:
                 fetched = get_balance()
                 if fetched is None:
-                    print("\n⚠️ Gagal fetch balance, menggunakan nilai terakhir.")
+                    # Jangan print — masuk event log agar dashboard tidak scroll
+                    add_event("⚠️  Balance gagal diambil, pakai nilai terakhir")
                 if check_stop_conditions():
                     state.is_running = False
                     break
 
-            # Place bet
+            # ── Place bet ─────────────────────────────────────────────
             try:
                 result = place_plinko_bet()
-                state.consecutive_errors = 0  # reset setelah bet berhasil
+                state.consecutive_errors = 0   # reset counter error setelah bet sukses
             except Exception as e:
                 state.consecutive_errors += 1
-                clear_line()
-                print(f"\n❌ Error bet #{state.total_bets + 1}: {str(e)}")
-                print(f"   Consecutive errors: {state.consecutive_errors}/{CONFIG['MAX_CONSECUTIVE_ERRORS']}")
+                err_short = str(e)[:50]         # potong pesan agar muat satu baris event
+                add_event(
+                    f"❌ Error #{state.total_bets+1}: {err_short} "
+                    f"({state.consecutive_errors}/{CONFIG['MAX_CONSECUTIVE_ERRORS']})"
+                )
+                update_dashboard()              # refresh dashboard agar event error terlihat
 
                 if state.consecutive_errors >= CONFIG['MAX_CONSECUTIVE_ERRORS']:
+                    # Error terlalu banyak → bersihkan dashboard, print kritis, berhenti
+                    clear_dashboard()
                     print("🛑 Terlalu banyak error berturut-turut. Menghentikan script.")
                     state.is_running = False
                     break
 
-                # Refresh balance dari API setelah error agar stop-loss tidak keputusan salah
-                # (bet mungkin sudah masuk server tapi response timeout/connection error)
-                print(f"⏳ Menunggu 5 detik lalu verifikasi saldo...")
+                # Verifikasi saldo setelah error (bet mungkin sudah masuk di server)
+                add_event("⏳ Menunggu 5 detik lalu verifikasi saldo...")
                 time.sleep(5)
                 get_balance()
-                continue  # skip delay normal, langsung retry
+                continue                        # langsung retry, skip delay normal
 
-            # Hitung bet berikutnya berdasarkan hasil
+            # ── Update state setelah bet sukses ───────────────────────
+            # Hitung nominal bet berikutnya berdasarkan hasil saat ini
             state.current_bet = calculate_next_bet(result.get('profit', 0))
 
-            # Update balance lokal dari profit bet — tanpa HTTP request tambahan
-            # Balance API di-refresh setiap 5 bet (di atas) agar tetap akurat
-            state.balance += result.get('profit', 0)
+            # Catat win untuk statistik akhir
+            if result.get('profit', 0) > 0:
+                state.win_count += 1
 
+            # Update balance lokal dari profit — tanpa HTTP tambahan
+            # (API di-refresh setiap 5 bet di atas untuk akurasi stop-loss)
+            state.balance += result.get('profit', 0)
             result['balance'] = state.balance
-            update_status(result)
-            append_log(result)
+
+            # ── Render dashboard & log ────────────────────────────────
+            update_dashboard(result)            # gambar ulang dashboard di tempat yang sama
+            append_log(result)                  # tulis ke file CSV
 
             # Trim log setiap 100 bet agar file tidak membengkak
             if state.total_bets % 100 == 0:
                 trim_log_if_needed()
 
+            # ── Cek kondisi berhenti ──────────────────────────────────
             if check_stop_conditions():
                 state.is_running = False
                 break
 
-            # Delay antar bet
+            # ── Delay sebelum bet berikutnya ──────────────────────────
             time.sleep(CONFIG['BASE_DELAY_MS'] / 1000.0)
             iteration += 1
 
     except KeyboardInterrupt:
-        print("\n\n⏹️  Script dihentikan oleh user (Ctrl+C)")
+        clear_dashboard()                       # bersihkan dashboard sebelum pesan berhenti
+        print("\n⏹️  Script dihentikan oleh user (Ctrl+C)")
 
     print_final_stats()
 
