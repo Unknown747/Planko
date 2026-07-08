@@ -72,7 +72,7 @@ menimpa nilai ini; `.env` menimpa preset; shell env / Replit Secrets menimpa seg
 | Variabel | Default | Keterangan |
 |---|---|---|
 | `STAKE_API_TOKEN` | — | **Wajib.** Token dari header `x-access-token` |
-| `RISK` | `LOW` | `LOW` / `MEDIUM` / `HIGH` |
+| `RISK` | `LOW` | `LOW` / `MEDIUM` / `HIGH` / `EXPERT` |
 | `ROWS` | `8` | Jumlah pin: 8–16 |
 | `CURRENCY` | `IDR` | Kode mata uang Stake |
 

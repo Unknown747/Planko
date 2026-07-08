@@ -169,7 +169,7 @@ print(f"  📂 Mode   : {_mode_label}{_pin_label}")
 
 # ==================== KONFIGURASI ====================
 
-VALID_RISKS = {'LOW', 'MEDIUM', 'HIGH'}
+VALID_RISKS = {'LOW', 'MEDIUM', 'HIGH', 'EXPERT'}
 VALID_ROWS = set(range(8, 17))  # 8–16
 
 def _parse_env():
@@ -194,8 +194,8 @@ def _parse_env():
 
     risk = os.getenv('RISK', 'LOW').upper()
     if risk not in VALID_RISKS:
-        errors.append(f"RISK='{risk}' tidak valid. Pilihan: LOW, MEDIUM, HIGH.")
-    risk_enum = risk.lower()  # Stake API pakai lowercase enum: low/medium/high
+        errors.append(f"RISK='{risk}' tidak valid. Pilihan: LOW, MEDIUM, HIGH, EXPERT.")
+    risk_enum = risk.lower()  # Stake API pakai lowercase enum: low/medium/high/expert
 
     rows = get_int('ROWS', 8)
     if rows not in VALID_ROWS:
@@ -333,7 +333,7 @@ def _parse_env():
     return {
         'STAKE_API_TOKEN': os.getenv('STAKE_API_TOKEN', ''),
         'RISK': risk,
-        'RISK_ENUM': risk_enum,               # 'low'/'medium'/'high' untuk GraphQL
+        'RISK_ENUM': risk_enum,               # 'low'/'medium'/'high'/'expert' untuk GraphQL
         'ROWS': rows,
         'BET_AMOUNT': bet_amount,             # bet dasar tetap (dipakai jika MIN/MAX tidak diisi)
         'BET_AMOUNT_MIN': bet_amount_min,     # batas bawah bet acak (0 = nonaktif)
@@ -616,7 +616,7 @@ def calculate_next_bet(last_profit: float) -> float:
 
 # ==================== GRAPHQL QUERIES ====================
 # Stake API: plinkoBet pakai argumen langsung (bukan wrapper input:{})
-# currency & risk adalah enum lowercase: idr, low/medium/high
+# currency & risk adalah enum lowercase: idr, low/medium/high/expert
 PLINKO_BET_MUTATION = """
 mutation PlinkoBet($amount: Float!, $currency: CurrencyEnum!, $rows: Int!, $risk: CasinoGamePlinkoRiskEnum!) {
   plinkoBet(amount: $amount, currency: $currency, rows: $rows, risk: $risk) {
@@ -745,7 +745,7 @@ def place_plinko_bet():
         'amount': state.current_bet,
         'currency': CONFIG['CURRENCY_ENUM'],  # 'idr'
         'rows': CONFIG['ROWS'],
-        'risk': CONFIG['RISK_ENUM'],          # 'low'/'medium'/'high'
+        'risk': CONFIG['RISK_ENUM'],          # 'low'/'medium'/'high'/'expert'
     }
 
     rate_limit_retries = 0
