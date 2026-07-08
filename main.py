@@ -239,10 +239,6 @@ def _parse_env():
     if jackpot_stop < 0:
         errors.append(f"JACKPOT_STOP_MULTIPLIER={jackpot_stop} tidak boleh negatif.")
 
-    wager_target = get_float('WAGER_TARGET', 0)
-    if wager_target < 0:
-        errors.append(f"WAGER_TARGET={wager_target} tidak boleh negatif.")
-
     take_profit = get_float('TAKE_PROFIT', 0)
     if take_profit < 0:
         errors.append(f"TAKE_PROFIT={take_profit} tidak boleh negatif.")
@@ -324,7 +320,6 @@ def _parse_env():
         'STOP_LOSS': stop_loss,               # saldo absolut minimum sebelum berhenti
         'MAX_LOSS': max_loss,                 # rugi relatif maks dari modal awal sesi (0 = nonaktif)
         'JACKPOT_STOP_MULTIPLIER': jackpot_stop,  # multiplier ambang jackpot-stop (0 = nonaktif)
-        'WAGER_TARGET': wager_target,
         'TAKE_PROFIT': take_profit,
         'TAKE_PROFIT_DELAY_SEC': take_profit_delay,
         'STRATEGY': strategy,
@@ -827,18 +822,6 @@ def update_dashboard(result=None):
     net_col  = _GRN if net >= 0 else _RED
     net_str  = _c(f"{net_sign}{format_rupiah(abs(net))}", net_col, _BOLD)
 
-    # Progress bar wager (hanya jika WAGER_TARGET diset)
-    wager_bar = ''
-    if CONFIG['WAGER_TARGET'] > 0:
-        pct    = min(state.total_wagered / CONFIG['WAGER_TARGET'], 1.0)
-        bar_w  = 14
-        filled = int(pct * bar_w)
-        wager_bar = (
-            f"  {_c('█' * filled, _CYN)}"
-            f"{'░' * (bar_w - filled)}"
-            f"  {pct*100:.0f}%"
-        )
-
     # Progress bar MAX_LOSS — bar merah menunjukkan seberapa dekat ke batas rugi
     loss_bar = ''
     if CONFIG['MAX_LOSS'] > 0:
@@ -902,7 +885,7 @@ def update_dashboard(result=None):
     rows.append(DIV)
     rows.append(f"  💳 Balance   : {_c(format_rupiah(state.balance), _BOLD)}")
     rows.append(f"  📈 Net P/L   : {net_str}")
-    rows.append(f"  🎯 Wager     : {format_rupiah(state.total_wagered)}{wager_bar}")
+    rows.append(f"  🎯 Wager     : {format_rupiah(state.total_wagered)}")
     if CONFIG['MAX_LOSS'] > 0:
         rows.append(f"  🛡️  Max Loss  : {format_rupiah(CONFIG['MAX_LOSS'])}{loss_bar}")
     rows.append(f"  🎲 Total Bet : {state.total_bets}")
@@ -999,8 +982,6 @@ def print_header():
         print(f"✅ Take Profit: +{format_rupiah(CONFIG['TAKE_PROFIT'])} profit (delay {CONFIG['TAKE_PROFIT_DELAY_SEC']}s)")
     if CONFIG['JACKPOT_STOP_MULTIPLIER'] > 0:
         print(f"🚨 Jackpot Stop: langsung berhenti jika kena x{CONFIG['JACKPOT_STOP_MULTIPLIER']:.0f}+")
-    if CONFIG['WAGER_TARGET'] > 0:
-        print(f"🎯 Wager Target: {format_rupiah(CONFIG['WAGER_TARGET'])}")
     # Info strategi
     if CONFIG['STRATEGY'] == 'FLAT':
         print(f"📐 Strategi  : FLAT (bet selalu tetap)")
@@ -1043,7 +1024,7 @@ def print_header():
 
 def check_stop_conditions():
     """
-    Cek semua kondisi stop: take profit, stop loss, wager target.
+    Cek semua kondisi stop: take profit, stop loss, max loss, jackpot.
     Sebelum print pesan, dashboard dibersihkan agar tidak tumpang tindih.
     Return True jika harus berhenti.
     """
@@ -1065,13 +1046,6 @@ def check_stop_conditions():
         state.tp_rearm_floor = state.net_profit
         state.dashboard_lines = 0               # paksa dashboard cetak ulang dari awal
         return False
-
-    # ── Wager target ─────────────────────────────────────────────────
-    if CONFIG['WAGER_TARGET'] > 0 and state.total_wagered >= CONFIG['WAGER_TARGET']:
-        clear_dashboard()
-        print(f"\n🎯 Wager target tercapai!")
-        print(f"   Total wagered: {format_rupiah(state.total_wagered)}")
-        return True
 
     # ── Stop loss absolut ────────────────────────────────────────────
     if CONFIG['STOP_LOSS'] > 0 and state.balance <= CONFIG['STOP_LOSS']:

@@ -100,7 +100,6 @@ menimpa nilai ini; `.env` menimpa preset; shell env / Replit Secrets menimpa seg
 | `TAKE_PROFIT` | `0` | Berhenti jika profit bersih ≥ nilai ini (0 = nonaktif) |
 | `TAKE_PROFIT_DELAY_SEC` | `30` | Countdown sebelum berhenti saat take profit (detik) |
 | `JACKPOT_STOP_MULTIPLIER` | `0` | Berhenti langsung jika kena multiplier ini (0 = nonaktif) |
-| `WAGER_TARGET` | `0` | Berhenti setelah total wager ini (0 = unlimited) |
 
 ### Safety & Log
 | Variabel | Default | Keterangan |
