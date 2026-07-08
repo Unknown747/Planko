@@ -33,19 +33,23 @@ _parser = argparse.ArgumentParser(
 )
 _parser.add_argument('mode', nargs='?', choices=['profit', 'wager'])
 _parser.add_argument('--config', '-c', metavar='FILE')
+_parser.add_argument('--rows', type=int, choices=[14, 16],
+                     help='Jumlah pin untuk mode profit (14 atau 16); lewati menu pin jika diisi')
 _parser.add_argument('--help', '-h', action='store_true')
 _args = _parser.parse_args()
 
 if _args.help:
     print("Cara pakai:")
-    print("  python3 main.py          → tampilkan menu pilihan mode")
-    print("  python3 main.py profit   → langsung mode profit")
-    print("  python3 main.py wager    → langsung mode wager")
-    print("  python3 main.py --config file.env  → file config kustom")
+    print("  python3 main.py               → tampilkan menu pilihan mode")
+    print("  python3 main.py profit        → mode profit (muncul menu pin)")
+    print("  python3 main.py profit --rows 14  → mode profit 14 pin langsung")
+    print("  python3 main.py profit --rows 16  → mode profit 16 pin langsung")
+    print("  python3 main.py wager         → langsung mode wager")
+    print("  python3 main.py --config file.env → file config kustom")
     sys.exit(0)
 
 def _tampilkan_menu():
-    """Tampilkan menu interaktif jika tidak ada argumen mode."""
+    """Tampilkan menu utama: pilih mode profit atau wager."""
     print()
     print("  ╔══════════════════════════════════════╗")
     print("  ║     🎰  PLINKO AUTO-BET STAKE.COM    ║")
@@ -54,12 +58,12 @@ def _tampilkan_menu():
     print("  ║   Pilih mode yang ingin dijalankan:  ║")
     print("  ║                                      ║")
     print("  ║   1.  💰 PROFIT                      ║")
-    print("  ║       Bet Rp 50 flat, cari cuan      ║")
-    print("  ║       Stop otomatis saat target hit  ║")
+    print("  ║       Bet Rp 50–100 acak, cari cuan  ║")
+    print("  ║       Expert mode, 1 bola per gilir  ║")
     print("  ║                                      ║")
     print("  ║   2.  🎯 WAGER                       ║")
-    print("  ║       Bet Rp 50–100, farming bonus   ║")
-    print("  ║       Ada recovery jika kalah        ║")
+    print("  ║       Bet Rp 500, max 2x recovery    ║")
+    print("  ║       Farming bonus, se-safe mungkin ║")
     print("  ║                                      ║")
     print("  ╚══════════════════════════════════════╝")
     print()
@@ -76,27 +80,74 @@ def _tampilkan_menu():
         else:
             print("  ⚠️  Masukkan 1 atau 2.")
 
+def _tampilkan_menu_pins():
+    """Sub-menu pilihan jumlah pin untuk mode Profit."""
+    print()
+    print("  ╔══════════════════════════════════════╗")
+    print("  ║      📌  PILIH JUMLAH PIN            ║")
+    print("  ╠══════════════════════════════════════╣")
+    print("  ║                                      ║")
+    print("  ║   1.  🎯 14 PIN                      ║")
+    print("  ║       Multiplier max ~420x            ║")
+    print("  ║       Lebih sering kena tengah        ║")
+    print("  ║                                      ║")
+    print("  ║   2.  🚀 16 PIN                      ║")
+    print("  ║       Multiplier max ~1000x           ║")
+    print("  ║       Lebih ekstrem, potensi jackpot  ║")
+    print("  ║                                      ║")
+    print("  ╚══════════════════════════════════════╝")
+    print()
+    while True:
+        try:
+            pilihan = input("  Masukkan pilihan [1/2] : ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n⏹️  Dibatalkan.")
+            sys.exit(0)
+        if pilihan == '1':
+            return 14
+        elif pilihan == '2':
+            return 16
+        else:
+            print("  ⚠️  Masukkan 1 atau 2.")
+
 # Tentukan mode: dari argumen atau tanya user
 _config_file = None
+_mode = None
+_rows_override = None
+
 if _args.config:
-    # File config kustom langsung
+    # File config kustom langsung — lewati semua menu
     _config_file = _args.config
     if not os.path.exists(_config_file):
         print(f"❌ File config tidak ditemukan: {_config_file}")
         sys.exit(1)
 else:
-    # Mode dari argumen atau menu interaktif
+    # Mode dari argumen CLI atau menu interaktif
     _mode = _args.mode if _args.mode else _tampilkan_menu()
     _config_file = f'config_{_mode}.env'
     if not os.path.exists(_config_file):
         print(f"❌ File preset tidak ditemukan: {_config_file}")
         sys.exit(1)
 
+    # Mode profit: tanya jumlah pin (14 atau 16)
+    # --rows di CLI melewati menu pin (berguna untuk nohup/VPS non-interaktif)
+    if _mode == 'profit':
+        if _args.rows:
+            _rows_override = _args.rows
+        else:
+            _rows_override = _tampilkan_menu_pins()
+
 # Muat config: preset dulu (default), lalu .env menimpa (prioritas lebih tinggi)
 load_dotenv(dotenv_path=_config_file)   # preset sebagai default
 load_dotenv(override=True)              # .env (token, dll) selalu menang
 
-print(f"  📂 Mode   : {_config_file.replace('config_','').replace('.env','').upper()}")
+# Terapkan override pin setelah load_dotenv agar mengalahkan nilai preset
+if _rows_override is not None:
+    os.environ['ROWS'] = str(_rows_override)
+
+_mode_label = _config_file.replace('config_', '').replace('.env', '').upper()
+_pin_label   = f" ({_rows_override} PIN)" if _rows_override else ""
+print(f"  📂 Mode   : {_mode_label}{_pin_label}")
 
 # ==================== KONFIGURASI ====================
 
