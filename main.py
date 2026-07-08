@@ -5,11 +5,67 @@ import random   # untuk bet acak & delay acak
 import time
 import os
 import sys
+import argparse
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Load .env file
-load_dotenv()
+# ==================== PEMILIHAN MODE / CONFIG ====================
+#
+# Cara pakai:
+#   python3 main.py               → pakai .env (default)
+#   python3 main.py profit        → preset mode profit (config_profit.env)
+#   python3 main.py wager         → preset mode wager  (config_wager.env)
+#   python3 main.py --config file.env → file config kustom apapun
+#
+# Urutan prioritas (dari tertinggi ke terendah):
+#   1. Env var yang sudah ada di shell (export VAR=...)
+#   2. File .env (token & override personal)
+#   3. File preset mode / --config (pengaturan game default)
+#
+# Artinya: cukup simpan STAKE_API_TOKEN di .env saja, lalu pilih mode
+# lewat argumen — tidak perlu copy-paste file config.
+
+_parser = argparse.ArgumentParser(
+    prog='main.py',
+    description='Auto Bet Plinko Stake.com',
+    formatter_class=argparse.RawTextHelpFormatter,
+)
+_parser.add_argument(
+    'mode',
+    nargs='?',                          # opsional
+    choices=['profit', 'wager'],
+    metavar='MODE',
+    help='Preset mode: profit  → config_profit.env\n'
+         '             wager   → config_wager.env',
+)
+_parser.add_argument(
+    '--config', '-c',
+    metavar='FILE',
+    help='Path ke file config kustom (contoh: --config mysettings.env)',
+)
+_args = _parser.parse_args()
+
+# Tentukan file config yang akan dimuat sebagai default/preset
+_config_file = None
+if _args.config:
+    _config_file = _args.config
+    if not os.path.exists(_config_file):
+        print(f"❌ File config tidak ditemukan: {_config_file}")
+        sys.exit(1)
+elif _args.mode:
+    _config_file = f'config_{_args.mode}.env'
+    if not os.path.exists(_config_file):
+        print(f"❌ File preset tidak ditemukan: {_config_file}")
+        sys.exit(1)
+
+# Muat config: preset/kustom dulu (sebagai default), lalu .env menimpa (prioritas lebih tinggi)
+if _config_file:
+    load_dotenv(dotenv_path=_config_file)        # preset sebagai default
+load_dotenv(override=True)                       # .env selalu menang atas preset
+
+# Tampilkan sumber config yang aktif
+if _config_file:
+    print(f"📂 Config: {_config_file}  (+.env jika ada)")
 
 # ==================== KONFIGURASI ====================
 
