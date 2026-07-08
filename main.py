@@ -28,44 +28,74 @@ from dotenv import load_dotenv
 _parser = argparse.ArgumentParser(
     prog='main.py',
     description='Auto Bet Plinko Stake.com',
-    formatter_class=argparse.RawTextHelpFormatter,
+    add_help=False,   # kita handle sendiri agar --help tetap bisa
 )
-_parser.add_argument(
-    'mode',
-    nargs='?',                          # opsional
-    choices=['profit', 'wager'],
-    metavar='MODE',
-    help='Preset mode: profit  → config_profit.env\n'
-         '             wager   → config_wager.env',
-)
-_parser.add_argument(
-    '--config', '-c',
-    metavar='FILE',
-    help='Path ke file config kustom (contoh: --config mysettings.env)',
-)
+_parser.add_argument('mode', nargs='?', choices=['profit', 'wager'])
+_parser.add_argument('--config', '-c', metavar='FILE')
+_parser.add_argument('--help', '-h', action='store_true')
 _args = _parser.parse_args()
 
-# Tentukan file config yang akan dimuat sebagai default/preset
+if _args.help:
+    print("Cara pakai:")
+    print("  python3 main.py          → tampilkan menu pilihan mode")
+    print("  python3 main.py profit   → langsung mode profit")
+    print("  python3 main.py wager    → langsung mode wager")
+    print("  python3 main.py --config file.env  → file config kustom")
+    sys.exit(0)
+
+def _tampilkan_menu():
+    """Tampilkan menu interaktif jika tidak ada argumen mode."""
+    print()
+    print("  ╔══════════════════════════════════════╗")
+    print("  ║     🎰  PLINKO AUTO-BET STAKE.COM    ║")
+    print("  ╠══════════════════════════════════════╣")
+    print("  ║                                      ║")
+    print("  ║   Pilih mode yang ingin dijalankan:  ║")
+    print("  ║                                      ║")
+    print("  ║   1.  💰 PROFIT                      ║")
+    print("  ║       Bet Rp 50 flat, cari cuan      ║")
+    print("  ║       Stop otomatis saat target hit  ║")
+    print("  ║                                      ║")
+    print("  ║   2.  🎯 WAGER                       ║")
+    print("  ║       Bet Rp 50–100, farming bonus   ║")
+    print("  ║       Ada recovery jika kalah        ║")
+    print("  ║                                      ║")
+    print("  ╚══════════════════════════════════════╝")
+    print()
+    while True:
+        try:
+            pilihan = input("  Masukkan pilihan [1/2] : ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n⏹️  Dibatalkan.")
+            sys.exit(0)
+        if pilihan == '1':
+            return 'profit'
+        elif pilihan == '2':
+            return 'wager'
+        else:
+            print("  ⚠️  Masukkan 1 atau 2.")
+
+# Tentukan mode: dari argumen atau tanya user
 _config_file = None
 if _args.config:
+    # File config kustom langsung
     _config_file = _args.config
     if not os.path.exists(_config_file):
         print(f"❌ File config tidak ditemukan: {_config_file}")
         sys.exit(1)
-elif _args.mode:
-    _config_file = f'config_{_args.mode}.env'
+else:
+    # Mode dari argumen atau menu interaktif
+    _mode = _args.mode if _args.mode else _tampilkan_menu()
+    _config_file = f'config_{_mode}.env'
     if not os.path.exists(_config_file):
         print(f"❌ File preset tidak ditemukan: {_config_file}")
         sys.exit(1)
 
-# Muat config: preset/kustom dulu (sebagai default), lalu .env menimpa (prioritas lebih tinggi)
-if _config_file:
-    load_dotenv(dotenv_path=_config_file)        # preset sebagai default
-load_dotenv(override=True)                       # .env selalu menang atas preset
+# Muat config: preset dulu (default), lalu .env menimpa (prioritas lebih tinggi)
+load_dotenv(dotenv_path=_config_file)   # preset sebagai default
+load_dotenv(override=True)              # .env (token, dll) selalu menang
 
-# Tampilkan sumber config yang aktif
-if _config_file:
-    print(f"📂 Config: {_config_file}  (+.env jika ada)")
+print(f"  📂 Mode   : {_config_file.replace('config_','').replace('.env','').upper()}")
 
 # ==================== KONFIGURASI ====================
 
