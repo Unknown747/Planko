@@ -160,27 +160,35 @@ except ValueError as _cfg_err:
 class State:
     def __init__(self):
         self.balance = 0.0
-        self.initial_balance = 0.0
-        self.balance_initialized = False  # True setelah saldo awal berhasil diambil
+        self.initial_balance = 0.0          # TIDAK pernah diubah setelah startup
+        self.balance_initialized = False    # True setelah saldo awal berhasil diambil
         self.total_wagered = 0.0
         self.total_bets = 0
         self.is_running = True
         self.consecutive_errors = 0
         self.start_time = datetime.now()
-        self.bet_results = []
+        self.bet_results = []               # rolling max 200 entri (kompatibilitas)
         # Strategi
         self.current_bet = CONFIG['BET_AMOUNT']  # bet aktif saat ini
         self.win_streak = 0                       # berapa kali menang berturut-turut
         self.loss_streak = 0                      # berapa kali kalah berturut-turut (Martingale)
         self.martingale_capped = False            # True jika bet terakhir sudah kena MAX_BET cap
         self.win_count = 0                        # total bet yang menang (untuk win rate final)
+        # Take-profit rearm
+        # Saat take-profit countdown dibatalkan, threshold naik agar tidak langsung trigger lagi.
+        # Menyimpan "floor" net_profit — trigger berikutnya hanya ketika:
+        #   net_profit >= tp_rearm_floor + TAKE_PROFIT
+        # initial_balance TIDAK disentuh sehingga net_profit selalu akurat sepanjang sesi.
+        self.tp_rearm_floor = 0.0
         # Dashboard
-        self.events = []                          # buffer pesan event penting (maks 4 baris)
-        self.dashboard_lines = 0                  # jumlah baris dashboard yang sedang tampil
+        self.events = []                    # buffer pesan event penting (maks 4 baris)
+        self.dashboard_lines = 0            # jumlah baris dashboard yang sedang tampil
 
     @property
     def net_profit(self):
-        """Profit bersih sejak bot mulai (balance sekarang - balance awal)."""
+        """Profit bersih sejak bot mulai (balance sekarang − balance awal).
+        Nilai ini selalu benar sepanjang sesi; take-profit rearm ditangani
+        lewat tp_rearm_floor, bukan dengan mengubah initial_balance."""
         return self.balance - self.initial_balance
 
 state = State()
@@ -377,10 +385,22 @@ def get_headers():
         'Accept-Language': 'en-US,en;q=0.9',
     }
 
-def get_balance():
-    """Cek saldo dari akun Stake. Return balance atau None jika gagal."""
+def get_balance(silent=False):
+    """
+    Cek saldo dari akun Stake. Return balance atau None jika gagal.
+
+    silent=False (default) → pesan error di-print ke terminal (dipakai saat startup).
+    silent=True            → pesan error masuk event log dashboard (dipakai di dalam loop).
+    """
+    def _warn(msg):
+        """Kirim pesan error ke tempat yang tepat sesuai konteks."""
+        if silent:
+            add_event(msg)
+        else:
+            print(msg)
+
     if not CONFIG['STAKE_API_TOKEN']:
-        print("❌ STAKE_API_TOKEN tidak ditemukan!")
+        _warn("❌ STAKE_API_TOKEN tidak ditemukan!")
         return None
 
     try:
@@ -393,18 +413,16 @@ def get_balance():
 
         if response.status_code != 200:
             if response.status_code == 403:
-                print("⚠️ HTTP 403: Token ditolak server.")
-                print("   → Token mungkin sudah expired. Ambil token baru dari browser.")
-                print("   → Buka Stake.com → F12 → Network → cari x-access-token di request header.")
+                _warn("⚠️ Balance: HTTP 403 — token expired, ambil token baru")
             else:
-                print(f"⚠️ Gagal cek balance: HTTP {response.status_code}")
+                _warn(f"⚠️ Balance: HTTP {response.status_code}")
             return None
 
         data = response.json()
 
         if 'errors' in data:
             error_msg = data['errors'][0].get('message', 'Unknown GraphQL error')
-            print(f"⚠️ GraphQL error saat cek balance: {error_msg}")
+            _warn(f"⚠️ Balance: GraphQL error — {error_msg[:40]}")
             return None
 
         # Response: data.user.balances[].available.{amount, currency}
@@ -418,14 +436,14 @@ def get_balance():
                 state.balance = balance
                 return balance
 
-        print(f"⚠️ Saldo {CONFIG['CURRENCY']} tidak ditemukan di akun.")
+        _warn(f"⚠️ Saldo {CONFIG['CURRENCY']} tidak ditemukan di akun.")
         return None
 
     except requests.exceptions.Timeout:
-        print("⚠️ Timeout saat cek balance.")
+        _warn("⚠️ Balance: timeout koneksi")
         return None
     except Exception as e:
-        print(f"⚠️ Error cek balance: {str(e)}")
+        _warn(f"⚠️ Balance: {str(e)[:40]}")
         return None
 
 def place_plinko_bet():
@@ -475,7 +493,10 @@ def place_plinko_bet():
             except (ValueError, TypeError):
                 retry_after = 5
             wait_time = max(retry_after, 5)
-            print(f"\n⚠️ Rate limit (429). Menunggu {wait_time}s... (retry #{rate_limit_retries}/{CONFIG['MAX_RATE_LIMIT_RETRIES']})")
+            add_event(
+                f"⚠️ Rate limit 429 — tunggu {wait_time}s "
+                f"(retry {rate_limit_retries}/{CONFIG['MAX_RATE_LIMIT_RETRIES']})"
+            )
             time.sleep(wait_time)
             continue  # ulangi request
 
@@ -510,7 +531,11 @@ def place_plinko_bet():
             'profit':     profit,
             'balance':    state.balance,
         }
+        # bet_results: rolling buffer 200 entri terbaru (kompatibilitas mundur).
+        # Statistik final memakai state.win_count + state.net_profit, bukan list ini.
         state.bet_results.append(result)
+        if len(state.bet_results) > 200:
+            state.bet_results.pop(0)            # buang entri paling lama, pertahankan terbaru
 
         return result
 
@@ -724,9 +749,11 @@ def check_stop_conditions():
     Return True jika harus berhenti.
     """
     # ── Take profit ─────────────────────────────────────────────────
-    # Guard balance_initialized mencegah false positive sebelum saldo awal terisi
-    if CONFIG['TAKE_PROFIT'] > 0 and state.balance_initialized and state.net_profit >= CONFIG['TAKE_PROFIT']:
-        clear_dashboard()                        # bersihkan dashboard dulu
+    # Guard balance_initialized mencegah false positive sebelum saldo awal terisi.
+    # Trigger ketika net_profit melampaui threshold saat ini (floor + TAKE_PROFIT).
+    tp_threshold = state.tp_rearm_floor + CONFIG['TAKE_PROFIT']
+    if CONFIG['TAKE_PROFIT'] > 0 and state.balance_initialized and state.net_profit >= tp_threshold:
+        clear_dashboard()
         net_str    = format_rupiah(state.net_profit)
         target_str = format_rupiah(CONFIG['TAKE_PROFIT'])
         print(f"\n✅ TAKE PROFIT! Profit: +{net_str} (target: +{target_str})")
@@ -734,8 +761,9 @@ def check_stop_conditions():
         should_stop = take_profit_countdown(CONFIG['TAKE_PROFIT_DELAY_SEC'])
         if should_stop:
             return True
-        # Jika countdown dibatalkan (Ctrl+C), geser baseline target agar tidak langsung trigger lagi
-        state.initial_balance = state.balance - CONFIG['TAKE_PROFIT'] + 1
+        # Countdown dibatalkan → naikkan floor agar trigger berikutnya butuh profit ekstra
+        # sebesar TAKE_PROFIT lagi. initial_balance TIDAK disentuh.
+        state.tp_rearm_floor = state.net_profit
         state.dashboard_lines = 0               # paksa dashboard cetak ulang dari awal
         return False
 
@@ -822,9 +850,8 @@ def main():
 
             # ── Refresh balance & cek stop setiap 5 bet ──────────────
             if iteration > 0 and iteration % 5 == 0:
-                fetched = get_balance()
+                fetched = get_balance(silent=True)   # error masuk event log, bukan print
                 if fetched is None:
-                    # Jangan print — masuk event log agar dashboard tidak scroll
                     add_event("⚠️  Balance gagal diambil, pakai nilai terakhir")
                 if check_stop_conditions():
                     state.is_running = False
@@ -853,7 +880,7 @@ def main():
                 # Verifikasi saldo setelah error (bet mungkin sudah masuk di server)
                 add_event("⏳ Menunggu 5 detik lalu verifikasi saldo...")
                 time.sleep(5)
-                get_balance()
+                get_balance(silent=True)        # error masuk event log, bukan print
                 continue                        # langsung retry, skip delay normal
 
             # ── Update state setelah bet sukses ───────────────────────
