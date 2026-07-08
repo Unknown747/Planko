@@ -726,9 +726,11 @@ def update_dashboard(result=None):
         m   = result.get('multiplier', 0)
         p_s = f"{'+'if p>0 else ''}{format_rupiah(p)}"
 
-        jackpot_thr = CONFIG['JACKPOT_STOP_MULTIPLIER'] if CONFIG['JACKPOT_STOP_MULTIPLIER'] > 0 else 420
-        if m >= jackpot_thr:
-            # Jackpot — muncul tebal kuning + masuk event log
+        # Tampilan jackpot hanya aktif jika JACKPOT_STOP_MULTIPLIER dikonfigurasi.
+        # Jika tidak diset (0), perlakukan seperti big win biasa (>= 10x).
+        jackpot_thr = CONFIG['JACKPOT_STOP_MULTIPLIER']
+        if jackpot_thr > 0 and m >= jackpot_thr:
+            # Jackpot stop aktif dan terkena — tampil tebal kuning + event log
             last_str = _c(f"🚨 JACKPOT! x{m:.0f}  {p_s}", _BOLD, _YLW)
             add_event(_c(f"🚨 JACKPOT x{m:.0f} hit! Profit: {p_s}", _BOLD, _YLW))
         elif m >= 10:
@@ -882,8 +884,13 @@ def print_header():
         print(f"   Pengali   : x{CONFIG['BET_MULTIPLIER']} saat kalah")
         print(f"   Cut-loss  : {loss_cap_str}")
         print(f"   Max bet   : {max_bet_str}")
-        # Simulasi eskalasi bet
-        sim, steps = CONFIG['BET_AMOUNT'], []
+        # Simulasi eskalasi bet — pakai bet dasar yang sebenarnya (min jika acak)
+        sim_start = (
+            CONFIG['BET_AMOUNT_MIN']
+            if CONFIG['BET_AMOUNT_MIN'] > 0 and CONFIG['BET_AMOUNT_MAX'] > 0
+            else CONFIG['BET_AMOUNT']
+        )
+        sim, steps = sim_start, []
         for i in range(min(8, CONFIG['LOSS_STREAK_CAP'] if CONFIG['LOSS_STREAK_CAP'] > 0 else 8)):
             steps.append(format_rupiah(sim))
             sim *= CONFIG['BET_MULTIPLIER']
