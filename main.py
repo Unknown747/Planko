@@ -300,6 +300,19 @@ def _parse_env():
     if log_max_lines < 10:
         errors.append(f"LOG_MAX_LINES={log_max_lines} harus minimal 10.")
 
+    # Auto-reset sesi & ringkasan berkala
+    session_reset_bets = get_int('SESSION_RESET_BETS', 0)
+    if session_reset_bets < 0:
+        errors.append(f"SESSION_RESET_BETS={session_reset_bets} tidak boleh negatif.")
+
+    session_reset_mins = get_int('SESSION_RESET_MINUTES', 0)
+    if session_reset_mins < 0:
+        errors.append(f"SESSION_RESET_MINUTES={session_reset_mins} tidak boleh negatif.")
+
+    summary_every = get_int('SUMMARY_EVERY_BETS', 0)
+    if summary_every != 0 and summary_every < 5:
+        errors.append(f"SUMMARY_EVERY_BETS={summary_every} harus minimal 5 atau 0 (nonaktif).")
+
     if errors:
         msg = "\n".join(f"  ❌ {e}" for e in errors)
         raise ValueError(f"\nKesalahan konfigurasi .env:\n{msg}\n\nPerbaiki file .env lalu jalankan ulang.")
@@ -332,6 +345,9 @@ def _parse_env():
         'GRAPHQL_URL': os.getenv('GRAPHQL_URL', 'https://stake.com/_api/graphql'),
         'LOG_FILE': log_file,
         'LOG_MAX_LINES': log_max_lines,
+        'SESSION_RESET_BETS': session_reset_bets,
+        'SESSION_RESET_MINUTES': session_reset_mins,
+        'SUMMARY_EVERY_BETS': summary_every,
     }
 
 try:
@@ -386,6 +402,10 @@ class State:
         self.dashboard_lines = 0            # jumlah baris dashboard yang sedang tampil
         self._event_log = []                # untuk non-TTY: semua event (append-only, tidak rolling)
         self._last_event_count = 0          # indeks berikutnya yang belum dicetak di _event_log
+        # Sesi
+        self.session_number = 1             # nomor sesi saat ini (mulai dari 1, naik tiap auto-reset)
+        self.session_start  = datetime.now() # waktu mulai sesi saat ini (direset saat auto-reset)
+        self._pending_session_reset = False  # True = reset diterapkan di awal iterasi berikutnya
 
     @property
     def net_profit(self):
@@ -770,6 +790,64 @@ def add_event(msg: str):
     if not _TTY:
         state._event_log.append(msg)  # simpan semua event tanpa batas untuk non-TTY
 
+def reset_session():
+    """
+    Reset statistik sesi tanpa menghentikan bot.
+    Dipanggil otomatis saat SESSION_RESET_BETS atau SESSION_RESET_MINUTES tercapai.
+
+    Yang direset  : initial_balance, total_bets, win_count, total_wagered,
+                    start_time, session_start, tp_rearm_floor.
+    Yang TIDAK direset: current_bet, win_streak, loss_streak
+                        (strategi tetap berlanjut lintas sesi).
+    """
+    prev_bets  = state.total_bets
+    prev_wins  = state.win_count
+    prev_net   = state.net_profit
+    net_sign   = '+' if prev_net >= 0 else ''
+    win_rate   = (prev_wins / prev_bets * 100) if prev_bets > 0 else 0
+
+    state.session_number   += 1
+    state.initial_balance   = state.balance
+    state.balance_initialized = True
+    state.total_bets        = 0
+    state.win_count         = 0
+    state.total_wagered     = 0.0
+    state.tp_rearm_floor    = 0.0
+    state.start_time        = datetime.now()
+    state.session_start     = datetime.now()
+    state.dashboard_lines   = 0    # paksa dashboard cetak ulang dari awal
+
+    summary = (
+        f"🔄 Sesi {state.session_number - 1} selesai: "
+        f"{prev_bets} bet  WR {win_rate:.0f}%  "
+        f"P/L {net_sign}{format_rupiah(abs(prev_net))}"
+    )
+    # add_event mengirim ke _event_log; update_dashboard() mencetak ke stdout
+    # (baik TTY maupun non-TTY) — tidak perlu print() langsung di sini.
+    add_event(summary)
+
+
+def print_periodic_summary():
+    """
+    Catat ringkasan berkala setiap SUMMARY_EVERY_BETS bet ke event log.
+    TTY   : tampil di panel bawah dashboard saat render berikutnya.
+    Non-TTY: dicetak oleh update_dashboard() melalui _event_log (tidak dobel).
+    """
+    bets     = state.total_bets
+    wins     = state.win_count
+    win_rate = (wins / bets * 100) if bets > 0 else 0
+    net      = state.net_profit
+    net_sign = '+' if net >= 0 else ''
+
+    msg = (
+        f"📊 [{bets} bet] "
+        f"WR: {win_rate:.1f}% ({wins}/{bets})  "
+        f"Net: {net_sign}{format_rupiah(abs(net))}  "
+        f"Bal: {format_rupiah(state.balance)}"
+    )
+    add_event(msg)
+
+
 def update_dashboard(result=None):
     """
     Render ulang blok statistik di posisi yang sama menggunakan ANSI
@@ -792,13 +870,15 @@ def update_dashboard(result=None):
             sign  = '+' if p >= 0 else ''
             net   = state.net_profit
             nsign = '+' if net >= 0 else ''
+            wr    = (state.win_count / state.total_bets * 100) if state.total_bets > 0 else 0
             print(
                 f"[{state.total_bets}] "
                 f"bet={format_rupiah(amt)} "
                 f"x{m:.2f} "
                 f"p={sign}{format_rupiah(p)} "
                 f"bal={format_rupiah(state.balance)} "
-                f"net={nsign}{format_rupiah(net)}",
+                f"net={nsign}{format_rupiah(net)} "
+                f"wr={wr:.1f}%",
                 flush=True
             )
         # Cetak hanya event yang belum pernah dicetak (gunakan _event_log,
@@ -889,6 +969,15 @@ def update_dashboard(result=None):
     if CONFIG['MAX_LOSS'] > 0:
         rows.append(f"  🛡️  Max Loss  : {format_rupiah(CONFIG['MAX_LOSS'])}{loss_bar}")
     rows.append(f"  🎲 Total Bet : {state.total_bets}")
+    # Win rate live
+    if state.total_bets > 0:
+        wr     = state.win_count / state.total_bets * 100
+        wr_col = _GRN if wr >= 50 else (_YLW if wr >= 40 else _RED)
+        wr_str = _c(f"{wr:.1f}%  ({state.win_count}/{state.total_bets})", wr_col)
+    else:
+        wr_str = _c('—', _DIM)
+    sesi_sfx = _c(f"  [Sesi #{state.session_number}]", _DIM) if state.session_number > 1 else ''
+    rows.append(f"  📊 Win Rate  : {wr_str}{sesi_sfx}")
     rows.append(DIV)
     rows.append(f"  ⚡ Last      : {last_str}")
     rows.append(f"  💡 Next Bet  : {format_rupiah(state.current_bet)}  {streak_str}")
@@ -1130,6 +1219,14 @@ def main():
     try:
         while state.is_running:
 
+            # ── Deferred session reset ────────────────────────────────
+            # Reset diterapkan di AWAL iterasi baru, bukan saat bet pemicu,
+            # sehingga bet pemicu sudah selesai dirender sebelum counter-counter direset.
+            if state._pending_session_reset:
+                state._pending_session_reset = False
+                reset_session()
+                update_dashboard()          # render ulang segera dengan counter baru
+
             # ── Refresh balance & cek stop setiap 5 bet ──────────────
             if iteration > 0 and iteration % 10 == 0:
                 fetched = get_balance(silent=True)   # error masuk event log, bukan print
@@ -1177,6 +1274,25 @@ def main():
             # (API di-refresh setiap 5 bet di atas untuk akurasi stop-loss)
             state.balance += result.get('profit', 0)
             result['balance'] = state.balance
+
+            # ── Ringkasan berkala ──────────────────────────────────────
+            if (CONFIG['SUMMARY_EVERY_BETS'] > 0
+                    and state.total_bets % CONFIG['SUMMARY_EVERY_BETS'] == 0):
+                print_periodic_summary()
+
+            # ── Auto-reset sesi ───────────────────────────────────────
+            _reset_by_bets = (
+                CONFIG['SESSION_RESET_BETS'] > 0
+                and state.total_bets > 0
+                and state.total_bets % CONFIG['SESSION_RESET_BETS'] == 0
+            )
+            _reset_by_time = (
+                CONFIG['SESSION_RESET_MINUTES'] > 0
+                and (datetime.now() - state.session_start).total_seconds()
+                    >= CONFIG['SESSION_RESET_MINUTES'] * 60
+            )
+            if _reset_by_bets or _reset_by_time:
+                state._pending_session_reset = True
 
             # ── Render dashboard & log ────────────────────────────────
             update_dashboard(result)            # gambar ulang dashboard di tempat yang sama
