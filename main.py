@@ -313,6 +313,10 @@ def _parse_env():
     if summary_every != 0 and summary_every < 5:
         errors.append(f"SUMMARY_EVERY_BETS={summary_every} harus minimal 5 atau 0 (nonaktif).")
 
+    balance_refresh_every = get_int('BALANCE_REFRESH_EVERY', 10)
+    if balance_refresh_every < 1:
+        errors.append(f"BALANCE_REFRESH_EVERY={balance_refresh_every} harus minimal 1.")
+
     if errors:
         msg = "\n".join(f"  ❌ {e}" for e in errors)
         raise ValueError(f"\nKesalahan konfigurasi .env:\n{msg}\n\nPerbaiki file .env lalu jalankan ulang.")
@@ -348,6 +352,7 @@ def _parse_env():
         'SESSION_RESET_BETS': session_reset_bets,
         'SESSION_RESET_MINUTES': session_reset_mins,
         'SUMMARY_EVERY_BETS': summary_every,
+        'BALANCE_REFRESH_EVERY': balance_refresh_every,
     }
 
 try:
@@ -406,6 +411,11 @@ class State:
         self.session_number = 1             # nomor sesi saat ini (mulai dari 1, naik tiap auto-reset)
         self.session_start  = datetime.now() # waktu mulai sesi saat ini (direset saat auto-reset)
         self._pending_session_reset = False  # True = reset diterapkan di awal iterasi berikutnya
+        # Statistik kumulatif — TIDAK pernah direset, mencakup seluruh run bot
+        self.lifetime_bets            = 0
+        self.lifetime_wins            = 0
+        self.lifetime_wagered         = 0.0
+        self.lifetime_initial_balance = 0.0  # diisi sekali di main() setelah fetch pertama
 
     @property
     def net_profit(self):
@@ -424,6 +434,11 @@ def _handle_sigterm(signum, frame):
     state.is_running = False
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
+# SIGHUP dikirim saat terminal disconnect di VPS (misalnya SSH putus).
+# Tangani sama seperti SIGTERM agar final stats tetap tercetak.
+# hasattr guard: SIGHUP tidak tersedia di Windows.
+if hasattr(signal, 'SIGHUP'):
+    signal.signal(signal.SIGHUP, _handle_sigterm)
 
 # ==================== ANSI COLORS ====================
 # Kode warna terminal — otomatis dinonaktifkan jika output bukan TTY
@@ -442,7 +457,9 @@ def _c(text, *codes):
 
 # ==================== LOG FILE ====================
 
-_LOG_HEADER = 'timestamp,bet_id,amount,payout,multiplier,profit,balance\n'
+_LOG_HEADER      = 'timestamp,bet_id,amount,payout,multiplier,profit,balance\n'
+_LOG_FLUSH_EVERY = 10           # tulis ke disk setiap N baris (kurangi I/O per-bet)
+_log_buffer: list = []          # buffer in-memory sebelum flush ke disk
 
 def init_log_file():
     """Buat file log CSV dengan header jika belum ada. Cetak path-nya."""
@@ -456,15 +473,31 @@ def init_log_file():
     except Exception as e:
         print(f"⚠️ Gagal buat log file: {e}")
 
+def _flush_log():
+    """Tulis semua baris di buffer ke disk sekaligus lalu kosongkan buffer."""
+    global _log_buffer
+    if not CONFIG['LOG_FILE'] or not _log_buffer:
+        return
+    try:
+        with open(CONFIG['LOG_FILE'], 'a', encoding='utf-8') as f:
+            f.writelines(_log_buffer)
+        _log_buffer = []
+    except Exception:
+        pass  # jangan sampai error log menghentikan bot
+
 def append_log(result: dict):
-    """Tambah satu baris ke log. Tidak ada I/O jika LOG_FILE kosong."""
+    """
+    Tambah satu baris ke buffer log.
+    Flush ke disk otomatis setiap _LOG_FLUSH_EVERY baris — tidak ada open/close per-bet.
+    """
+    global _log_buffer
     if not CONFIG['LOG_FILE']:
         return
     try:
-        ts  = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        amt = result.get('amount', 0)
+        ts     = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        amt    = result.get('amount', 0)
         payout = amt + result.get('profit', 0)
-        line = (
+        line   = (
             f"{ts},"
             f"{result.get('bet_id', '')},"
             f"{amt:.2f},"
@@ -473,8 +506,9 @@ def append_log(result: dict):
             f"{result.get('profit', 0):.2f},"
             f"{result.get('balance', 0):.2f}\n"
         )
-        with open(CONFIG['LOG_FILE'], 'a', encoding='utf-8') as f:
-            f.write(line)
+        _log_buffer.append(line)
+        if len(_log_buffer) >= _LOG_FLUSH_EVERY:
+            _flush_log()
     except Exception:
         pass  # jangan sampai error log menghentikan bot
 
@@ -486,6 +520,7 @@ def trim_log_if_needed():
     if not CONFIG['LOG_FILE']:
         return
     try:
+        _flush_log()    # pastikan semua buffer sudah di disk sebelum membaca ulang
         with open(CONFIG['LOG_FILE'], 'r', encoding='utf-8') as f:
             lines = f.readlines()
         # lines[0] = header, lines[1:] = data
@@ -806,9 +841,15 @@ def reset_session():
     net_sign   = '+' if prev_net >= 0 else ''
     win_rate   = (prev_wins / prev_bets * 100) if prev_bets > 0 else 0
 
-    state.session_number   += 1
-    state.initial_balance   = state.balance
-    state.balance_initialized = True
+    # Ambil balance fresh dari API agar initial_balance sesi baru akurat.
+    # Jika gagal (network blip), fallback ke state.balance lokal.
+    fetched = get_balance(silent=True)
+    fresh_balance = fetched if fetched is not None else state.balance
+
+    state.session_number      += 1
+    state.initial_balance      = fresh_balance
+    state.balance              = fresh_balance   # sinkronkan juga state lokal
+    state.balance_initialized  = True
     state.total_bets        = 0
     state.win_count         = 0
     state.total_wagered     = 0.0
@@ -1158,6 +1199,7 @@ def check_stop_conditions():
 
 def print_final_stats():
     """Print statistik akhir setelah dashboard dibersihkan."""
+    _flush_log()                                 # pastikan semua buffer log tertulis ke disk
     clear_dashboard()                            # hapus dashboard agar tidak tumpang tindih
     print("\n" + "="*55)
     print("📊  S T A T I S T I K   A K H I R")
@@ -1166,18 +1208,35 @@ def print_final_stats():
     minutes = int(elapsed.total_seconds() // 60)
     seconds = int(elapsed.total_seconds() % 60)
 
+    # ── Sesi terakhir ────────────────────────────────────────────────
+    if state.session_number > 1:
+        print(f"🔄 Sesi Terakhir : #{state.session_number}")
     print(f"⏱️  Durasi        : {minutes}m {seconds}s")
     print(f"🎯 Total Bets    : {state.total_bets}")
     print(f"💰 Total Wagered : {format_rupiah(state.total_wagered)}")
     print(f"💳 Final Balance : {format_rupiah(state.balance)}")
 
     if state.total_bets > 0:
-        # Gunakan state.win_count yang ditrack per-bet (tidak perlu iterasi list)
         win_rate   = (state.win_count / state.total_bets) * 100
         net_profit = state.net_profit
         profit_str = f"+{format_rupiah(net_profit)}" if net_profit >= 0 else format_rupiah(net_profit)
         print(f"📈 Win Rate      : {win_rate:.1f}% ({state.win_count}/{state.total_bets})")
         print(f"💹 Net Profit    : {profit_str}")
+
+    # ── Statistik kumulatif semua sesi (hanya tampil jika > 1 sesi) ──
+    if state.session_number > 1 and state.lifetime_bets > 0:
+        print("─"*55)
+        print("🌐  TOTAL SEMUA SESI")
+        print("─"*55)
+        all_wr  = (state.lifetime_wins / state.lifetime_bets) * 100
+        all_net = state.balance - state.lifetime_initial_balance
+        all_sgn = '+' if all_net >= 0 else ''
+        print(f"🎯 Total Bets    : {state.lifetime_bets}")
+        print(f"💰 Total Wagered : {format_rupiah(state.lifetime_wagered)}")
+        print(f"📈 Win Rate      : {all_wr:.1f}% ({state.lifetime_wins}/{state.lifetime_bets})")
+        print(f"💹 Net Profit    : {all_sgn}{format_rupiah(abs(all_net))}")
+        print(f"💳 Balance Awal  : {format_rupiah(state.lifetime_initial_balance)}")
+        print(f"💳 Balance Akhir : {format_rupiah(state.balance)}")
 
     print("="*55)
     print("👋 Script selesai.")
@@ -1194,15 +1253,23 @@ def main():
         print("📌 Cara dapat token: buka Stake.com → F12 → Network → cari x-access-token di request header")
         sys.exit(1)
 
-    # Ambil saldo awal
+    # Ambil saldo awal — retry maks 3x dengan jeda 3 detik antar percobaan
     print("🔄 Mengambil saldo awal...")
-    initial_balance = get_balance()
+    initial_balance = None
+    for _attempt in range(1, 4):
+        initial_balance = get_balance()
+        if initial_balance is not None:
+            break
+        if _attempt < 3:
+            print(f"⚠️  Percobaan {_attempt}/3 gagal, coba ulang dalam 3 detik...")
+            time.sleep(3)
     if initial_balance is None:
-        print("❌ Gagal mengambil saldo. Periksa token dan koneksi.")
+        print("❌ Gagal mengambil saldo setelah 3 percobaan. Periksa token dan koneksi.")
         sys.exit(1)
 
-    state.initial_balance = initial_balance
-    state.balance_initialized = True
+    state.initial_balance         = initial_balance
+    state.lifetime_initial_balance = initial_balance   # diset sekali, tidak pernah berubah
+    state.balance_initialized     = True
     print(f"✅ Saldo awal: {format_rupiah(initial_balance)} {CONFIG['CURRENCY']}")
     if CONFIG['TAKE_PROFIT'] > 0:
         target_balance = initial_balance + CONFIG['TAKE_PROFIT']
@@ -1227,8 +1294,8 @@ def main():
                 reset_session()
                 update_dashboard()          # render ulang segera dengan counter baru
 
-            # ── Refresh balance & cek stop setiap 5 bet ──────────────
-            if iteration > 0 and iteration % 10 == 0:
+            # ── Refresh balance & cek stop (interval dari BALANCE_REFRESH_EVERY) ──
+            if iteration > 0 and iteration % CONFIG['BALANCE_REFRESH_EVERY'] == 0:
                 fetched = get_balance(silent=True)   # error masuk event log, bukan print
                 if fetched is None:
                     add_event("⚠️  Balance gagal diambil, pakai nilai terakhir")
@@ -1266,9 +1333,12 @@ def main():
             # Hitung nominal bet berikutnya berdasarkan hasil saat ini
             state.current_bet = calculate_next_bet(result.get('profit', 0))
 
-            # Catat win untuk statistik akhir
+            # Catat win untuk statistik sesi & kumulatif
             if result.get('profit', 0) > 0:
-                state.win_count += 1
+                state.win_count   += 1
+                state.lifetime_wins += 1
+            state.lifetime_bets    += 1
+            state.lifetime_wagered += result.get('amount', 0)
 
             # Update balance lokal dari profit — tanpa HTTP tambahan
             # (API di-refresh setiap 5 bet di atas untuk akurasi stop-loss)
@@ -1333,6 +1403,14 @@ def main():
     except KeyboardInterrupt:
         clear_dashboard()                       # bersihkan dashboard sebelum pesan berhenti
         print("\n⏹️  Script dihentikan oleh user (Ctrl+C)")
+    except Exception as _err:
+        # Exception tak terduga — bersihkan dashboard & log, lalu re-raise
+        clear_dashboard()
+        _flush_log()
+        raise _err
+    finally:
+        # Jaminan flush log pada semua jalur keluar (normal, Ctrl+C, error, SIGTERM/SIGHUP)
+        _flush_log()
 
     print_final_stats()
 
