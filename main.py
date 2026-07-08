@@ -2,6 +2,7 @@
 # main.py - Auto Bet Plinko Stake.com
 import requests
 import random   # untuk bet acak & delay acak
+import signal
 import time
 import os
 import sys
@@ -313,7 +314,6 @@ class State:
         self.is_running = True
         self.consecutive_errors = 0
         self.start_time = datetime.now()
-        self.bet_results = []               # rolling max 200 entri (kompatibilitas)
         # Strategi
         self.current_bet = get_base_bet()   # bet pertama: acak jika MIN/MAX diisi
         self.win_streak = 0                       # berapa kali menang berturut-turut
@@ -329,6 +329,7 @@ class State:
         # Dashboard
         self.events = []                    # buffer pesan event penting (maks 4 baris)
         self.dashboard_lines = 0            # jumlah baris dashboard yang sedang tampil
+        self._last_event_count = 0          # untuk non-TTY: track event yang sudah dicetak
 
     @property
     def net_profit(self):
@@ -338,6 +339,15 @@ class State:
         return self.balance - self.initial_balance
 
 state = State()
+
+# ==================== SIGNAL HANDLING ====================
+# SIGTERM dikirim oleh `kill <pid>` di VPS — tangani sama seperti Ctrl+C
+# agar bot berhenti dengan bersih (final stats dicetak, dashboard dihapus).
+def _handle_sigterm(signum, frame):
+    """Tandai bot agar berhenti di akhir iterasi berikutnya."""
+    state.is_running = False
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
 
 # ==================== ANSI COLORS ====================
 # Kode warna terminal — otomatis dinonaktifkan jika output bukan TTY
@@ -678,13 +688,7 @@ def place_plinko_bet():
             'currency':   bet_data.get('currency', CONFIG['CURRENCY_ENUM']),
             'multiplier': float(bet_data.get('payoutMultiplier', 0)),
             'profit':     profit,
-            'balance':    state.balance,
         }
-        # bet_results: rolling buffer 200 entri terbaru (kompatibilitas mundur).
-        # Statistik final memakai state.win_count + state.net_profit, bukan list ini.
-        state.bet_results.append(result)
-        if len(state.bet_results) > 200:
-            state.bet_results.pop(0)            # buang entri paling lama, pertahankan terbaru
 
         return result
 
@@ -707,11 +711,39 @@ def update_dashboard(result=None):
     Render ulang blok statistik di posisi yang sama menggunakan ANSI
     cursor-up. Terminal tidak pernah scroll selama bot berjalan.
 
-    Teknik:
+    Non-TTY (nohup/pipe): cetak satu baris teks polos per bet agar log
+    file tetap bersih tanpa escape code cursor.
+
+    Teknik TTY:
       1. Geser kursor ke atas sejumlah baris dashboard sebelumnya.
       2. Tulis ulang setiap baris (hapus dulu dengan \\033[2K).
     Hasilnya: dashboard selalu tampil di tempat yang sama, tidak bertambah.
     """
+    # ── Mode non-TTY: satu baris plain-text per bet ─────────────────
+    if not _TTY:
+        if result:
+            p     = result.get('profit', 0)
+            m     = result.get('multiplier', 0)
+            amt   = result.get('amount', 0)   # nominal bet yang benar-benar dieksekusi
+            sign  = '+' if p >= 0 else ''
+            net   = state.net_profit
+            nsign = '+' if net >= 0 else ''
+            print(
+                f"[{state.total_bets}] "
+                f"bet={format_rupiah(amt)} "
+                f"x{m:.2f} "
+                f"p={sign}{format_rupiah(p)} "
+                f"bal={format_rupiah(state.balance)} "
+                f"net={nsign}{format_rupiah(net)}",
+                flush=True
+            )
+        # Cetak hanya event yang belum pernah dicetak (hindari duplikasi)
+        new_events = state.events[state._last_event_count:]
+        for ev in new_events:
+            print(ev, flush=True)
+        state._last_event_count = len(state.events)
+        return
+
     # ── Hitung nilai statistik ──────────────────────────────────────
     elapsed_sec = (datetime.now() - state.start_time).total_seconds()
     mins = int(elapsed_sec // 60)
@@ -833,7 +865,11 @@ def clear_dashboard():
     """
     Hapus blok dashboard dari terminal agar pesan stop/error kritis
     bisa dicetak normal di bawahnya tanpa tumpang tindih.
+    Non-TTY: tidak ada yang perlu dihapus, langsung return.
     """
+    if not _TTY:
+        state.dashboard_lines = 0
+        return
     if state.dashboard_lines > 0:
         # Naik ke baris pertama, hapus setiap baris, kembali ke atas
         sys.stdout.write(f'\033[{state.dashboard_lines}A')
@@ -842,13 +878,6 @@ def clear_dashboard():
         sys.stdout.write(f'\033[{state.dashboard_lines}A')
         state.dashboard_lines = 0
         sys.stdout.flush()
-
-def clear_line():
-    """
-    Kompatibilitas mundur — gunakan clear_dashboard() di kode baru.
-    Menghapus satu baris (dipakai sebelum ada sistem dashboard).
-    """
-    clear_dashboard()    # sekarang membersihkan seluruh dashboard
 
 def take_profit_countdown(seconds):
     """
@@ -864,7 +893,7 @@ def take_profit_countdown(seconds):
         print()  # newline setelah countdown
         return True  # konfirmasi berhenti
     except KeyboardInterrupt:
-        clear_line()
+        clear_dashboard()
         print("\n▶️  Countdown dibatalkan, melanjutkan bet...\n")
         return False  # lanjut bet
 

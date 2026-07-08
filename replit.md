@@ -27,13 +27,11 @@ requirements.txt # Dependensi Python
 git clone <repo-url>
 cd <folder>
 bash setup.sh        # install deps + isi .env interaktif
-source venv/bin/activate
 python3 main.py
 ```
 
 #### Background process (VPS)
 ```bash
-source venv/bin/activate
 nohup python3 main.py > plinko.log 2>&1 &
 echo "PID: $!"
 
