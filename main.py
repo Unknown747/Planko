@@ -103,11 +103,11 @@ def _tampilkan_menu_pins():
     print("  ╠══════════════════════════════════════╣")
     print("  ║                                      ║")
     print("  ║   1.  🎯 14 PIN                      ║")
-    print("  ║       Multiplier max ~420x            ║")
+    print("  ║       Multiplier max ~2300x           ║")
     print("  ║       Lebih sering kena tengah        ║")
     print("  ║                                      ║")
     print("  ║   2.  🚀 16 PIN                      ║")
-    print("  ║       Multiplier max ~1000x           ║")
+    print("  ║       Multiplier max ~10000x          ║")
     print("  ║       Lebih ekstrem, potensi jackpot  ║")
     print("  ║                                      ║")
     print("  ╚══════════════════════════════════════╝")
@@ -251,7 +251,7 @@ def _parse_env():
         errors.append(f"MAX_LOSS={max_loss} tidak boleh negatif.")
 
     # Jackpot stop: berhenti LANGSUNG (tanpa countdown) jika multiplier >= nilai ini
-    # Contoh: JACKPOT_STOP_MULTIPLIER=420 → kunci profit saat kena x420 atau lebih
+    # Contoh: JACKPOT_STOP_MULTIPLIER=2300 → kunci profit saat kena x2300 atau lebih (14-pin Expert)
     jackpot_stop = get_float('JACKPOT_STOP_MULTIPLIER', 0)   # 0 = nonaktif
     if jackpot_stop < 0:
         errors.append(f"JACKPOT_STOP_MULTIPLIER={jackpot_stop} tidak boleh negatif.")
