@@ -138,9 +138,17 @@ else:
         else:
             _rows_override = _tampilkan_menu_pins()
 
-# Muat config: preset dulu (default), lalu .env menimpa (prioritas lebih tinggi)
-load_dotenv(dotenv_path=_config_file)   # preset sebagai default
-load_dotenv(override=True)              # .env (token, dll) selalu menang
+# Muat config dengan urutan prioritas yang benar:
+#   shell / Replit Secrets  (tertinggi — sudah ada di os.environ sebelum script jalan)
+#   .env                    (tengah   — token & override personal)
+#   preset config           (terendah — nilai default game)
+#
+# Teknik: simpan env shell/Secrets sebelum load_dotenv, lalu pulihkan sesudahnya.
+# Ini perlu karena load_dotenv(override=True) akan menimpa shell vars jika tidak dijaga.
+_shell_env = dict(os.environ)                   # simpan env shell / Replit Secrets
+load_dotenv(dotenv_path=_config_file, override=True)  # preset: set semua nilai dasar
+load_dotenv(override=True)                      # .env menimpa preset
+os.environ.update(_shell_env)                   # shell/Secrets kembali jadi yang utama
 
 # Terapkan override pin setelah load_dotenv agar mengalahkan nilai preset
 if _rows_override is not None:
@@ -1011,13 +1019,21 @@ def print_header():
             else CONFIG['BET_AMOUNT']
         )
         sim, steps = sim_start, []
-        for i in range(min(8, CONFIG['LOSS_STREAK_CAP'] if CONFIG['LOSS_STREAK_CAP'] > 0 else 8)):
+        max_levels = CONFIG['LOSS_STREAK_CAP'] if CONFIG['LOSS_STREAK_CAP'] > 0 else 8
+        for i in range(min(8, max_levels)):
             steps.append(format_rupiah(sim))
-            sim *= CONFIG['BET_MULTIPLIER']
-            if CONFIG['MAX_BET'] > 0 and sim > CONFIG['MAX_BET']:
-                steps.append(f"{format_rupiah(CONFIG['MAX_BET'])} (cap)")
+            next_sim = sim * CONFIG['BET_MULTIPLIER']
+            if CONFIG['MAX_BET'] > 0 and next_sim > CONFIG['MAX_BET']:
+                # Tampilkan cap bet hanya jika tidak ada LOSS_STREAK_CAP yang akan
+                # memotong lebih awal — jika LOSS_STREAK_CAP=2 dan kita sudah di level 2,
+                # bot reset lewat streak, bukan lewat cap, jadi cap tidak perlu ditampilkan.
+                if CONFIG['LOSS_STREAK_CAP'] == 0:
+                    steps.append(f"{format_rupiah(CONFIG['MAX_BET'])} (cap)")
                 break
-        print(f"   Eskalasi  : {' → '.join(steps)}")
+            sim = next_sim
+        # Akhiri dengan '→ ...' jika unlimited, '→ reset' jika ada batas
+        suffix = ' → ...' if CONFIG['LOSS_STREAK_CAP'] == 0 and len(steps) == 8 else ' → reset'
+        print(f"   Eskalasi  : {' → '.join(steps)}{suffix}")
     print("="*55)
 
 def check_stop_conditions():
