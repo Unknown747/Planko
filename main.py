@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # main.py - Auto Bet Plinko Stake.com
+
+# ── Cek versi Python sebelum import lainnya ──────────────────────────────────
+import sys as _sys
+if _sys.version_info < (3, 8):
+    _sys.exit(
+        f"❌ Python 3.8+ diperlukan (kamu punya {_sys.version.split()[0]}).\n"
+        "   Upgrade: sudo apt install python3.8  atau  pyenv install 3.8.x"
+    )
+
 import requests
 import random   # untuk bet acak & delay acak
 import signal

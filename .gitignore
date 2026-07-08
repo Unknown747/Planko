@@ -1,0 +1,23 @@
+# Token & konfigurasi personal — JANGAN pernah di-commit
+.env
+
+# Log CSV yang digenerate otomatis
+plinko_*.csv
+*.csv
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Distribusi & build
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment (jika ada)
+venv/
+.venv/
+env/

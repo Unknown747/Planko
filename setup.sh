@@ -37,6 +37,12 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 success "Ditemukan: $(python3 --version 2>&1)"
 
+# Validasi versi minimum Python 3.8
+_py_ver=$(python3 -c "import sys; print(sys.version_info >= (3,8))" 2>/dev/null)
+if [ "$_py_ver" != "True" ]; then
+    die "Python 3.8+ diperlukan. Versi kamu: $(python3 --version 2>&1)\n   Upgrade: sudo apt install python3.8"
+fi
+
 # ── 2. Install dependensi ─────────────────────────────────
 # BUG FIX: pakai 'python3 -m pip' bukan 'pip3' agar lebih portabel
 # (pip3 tidak selalu ada meski python3 sudah terinstall)

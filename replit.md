@@ -3,7 +3,7 @@
 Bot Python untuk melakukan auto-bet pada game Plinko di Stake.com via GraphQL API.
 
 ## Stack
-- Python 3.12
+- Python **3.8+** (direkomendasikan 3.10+)
 - `requests` — HTTP client
 - `python-dotenv` — baca file `.env`
 
@@ -49,11 +49,18 @@ echo "PID: $!"
 nohup python3 main.py wager > plinko.log 2>&1 &
 echo "PID: $!"
 
-# Lihat log
+# Lihat log real-time
 tail -f plinko.log
 
 # Stop
 kill $(pgrep -f 'python3 main.py')
+```
+
+#### Dengan screen/tmux (alternatif nohup — bisa re-attach)
+```bash
+screen -S plinko
+python3 main.py profit --rows 14
+# Ctrl+A lalu D untuk detach; screen -r plinko untuk kembali
 ```
 
 ## Konfigurasi
@@ -108,6 +115,29 @@ menimpa nilai ini; `.env` menimpa preset; shell env / Replit Secrets menimpa seg
 | `MAX_RATE_LIMIT_RETRIES` | `10` | Maks retry saat kena rate limit 429 |
 | `LOG_FILE` | `auto` | `auto` = nama otomatis, `NONE` = nonaktif, atau nama file kustom |
 | `LOG_MAX_LINES` | `1000` | Maks baris data di CSV; lebih lama otomatis dipangkas |
+
+### Sesi, Ringkasan & Monitoring
+| Variabel | Default | Keterangan |
+|---|---|---|
+| `SESSION_RESET_BETS` | `0` | Reset statistik sesi setiap N bet tanpa menghentikan bot (0 = nonaktif) |
+| `SESSION_RESET_MINUTES` | `0` | Reset statistik sesi setiap N menit (0 = nonaktif) |
+| `SUMMARY_EVERY_BETS` | `0` | Cetak ringkasan (win rate, net P/L, balance) setiap N bet, min 5 (0 = nonaktif) |
+| `BALANCE_REFRESH_EVERY` | `10` | Refresh balance dari API setiap N bet (min 1) |
+
+## Fitur Dashboard (TTY)
+- **Win rate live** — ditampilkan real-time di dashboard dengan warna (hijau ≥50%, kuning ≥40%, merah <40%)
+- **Auto-reset sesi** — reset counter tanpa henti; strategi (streak, bet) tetap berlanjut lintas sesi
+- **Statistik lifetime** — setelah 2+ sesi, statistik kumulatif ditampilkan di akhir run
+- **Ringkasan berkala** — snapshot win rate + P/L setiap N bet di event log
+
+## Signal Handling
+| Signal | Efek |
+|---|---|
+| `Ctrl+C` / `SIGINT` | Berhenti bersih, cetak statistik akhir |
+| `SIGTERM` | Sama seperti Ctrl+C (kompatibel `kill <pid>`) |
+| `SIGHUP` | Sama seperti Ctrl+C (terminal disconnect di VPS) |
+
+Log CSV di-flush ke disk sebelum exit di semua jalur keluar.
 
 ## Cara Dapat Token
 1. Buka [Stake.com](https://stake.com) dan login
